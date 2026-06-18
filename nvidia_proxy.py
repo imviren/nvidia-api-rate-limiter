@@ -559,10 +559,44 @@ async def proxy_handler(request: Request, path: str):
             status_code=502,
         )
 
-    # If NVIDIA still answered 429 after all retries, record it as a rate-limit
-    # event (the body is streamed back to the client unchanged below).
-    if upstream.status_code == 429:
-        stats["rate_limited_requests"] += 1
+    # Non-2xx from NVIDIA: read the (small) error body in full so we can log
+    # EXACTLY why it was rejected.  This is the only place NVIDIA tells us which
+    # limit was hit (RPM vs tokens-per-minute vs concurrency vs credits), so we
+    # surface its status, every rate-limit header, and the body to the console.
+    if upstream.status_code >= 400:
+        err_body = await upstream.aread()
+        await upstream.aclose()
+        await client.aclose()
+
+        rl_headers = {
+            k: v for k, v in upstream.headers.items()
+            if "ratelimit" in k.lower() or k.lower() in ("retry-after", "x-request-id", "nvcf-reqid")
+        }
+        snippet = err_body[:800].decode("utf-8", "replace")
+        print(
+            f"[proxy] NVIDIA {upstream.status_code} for {request.method} /{path}\n"
+            f"        rate-limit headers: {rl_headers or '(none)'}\n"
+            f"        body: {snippet}"
+        )
+
+        if upstream.status_code == 429:
+            req_info.status = "rate-limited"
+            stats["rate_limited_requests"] += 1
+        else:
+            req_info.status = "failed"
+        stats["failed_requests"] += 1
+        req_info.response_time = round(time.time() - request_start, 2)
+        request_log.append(req_info)
+
+        resp_headers = {
+            k: v for k, v in upstream.headers.items()
+            if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+        }
+        return Response(
+            content=err_body,
+            status_code=upstream.status_code,
+            headers=resp_headers,
+        )
 
     # Forward status + headers as-is (keep content-encoding; drop content-length
     # and hop-by-hop since we re-emit the body as a chunked stream).
@@ -597,12 +631,13 @@ async def proxy_handler(request: Request, path: str):
             stats["failed_requests"] += 1
             finalised = True
             print(f"[proxy] upstream body stream timed out for {request.method} /{path}")
-        except Exception:
+        except Exception as exc:
             req_info.status = "failed"
             req_info.response_time = round(time.time() - request_start, 2)
             stats["failed_requests"] += 1
             finalised = True
-            print(f"[proxy] upstream body stream error for {request.method} /{path}")
+            print(f"[proxy] upstream body stream error for {request.method} /{path}: "
+                  f"{type(exc).__name__}: {exc}")
         finally:
             if not finalised:
                 req_info.status = "failed"
