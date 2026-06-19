@@ -53,20 +53,24 @@ async def release_slot_and_decrement():
     get_concurrency_semaphore().release()
 
 async def wait_for_holdout():
+    """
+    Wait for previous stream to complete, then enforce COOLDOWN_BUFFER holdout.
+    Returns (holdout_waited, gap_from_previous_completion) in seconds.
+    """
     global last_completion_time
 
     await stream_complete_event.wait()
 
     now = time.monotonic()
-    elapsed = now - last_completion_time
+    gap = now - last_completion_time
 
-    if elapsed < COOLDOWN_BUFFER:
-        wait_needed = COOLDOWN_BUFFER - elapsed
+    if gap < COOLDOWN_BUFFER:
+        wait_needed = COOLDOWN_BUFFER - gap
         print(f"[pacing-engine] Strict holdout active. Waiting {wait_needed:.2f}s...")
         await asyncio.sleep(wait_needed)
-        return wait_needed
+        return wait_needed, gap
 
-    return 0.0
+    return 0.0, gap
 
 rate_limit_window = deque()
 rate_limit_lock = asyncio.Lock()
@@ -373,14 +377,10 @@ async def proxy_handler(request: Request, path: str):
     wait_start = time.time()
 
     async with SEQUENTIAL_LOCK:
-        now_before_holdout = time.monotonic()
-        gap_from_previous = now_before_holdout - last_completion_time
-
-        holdout_waited = await wait_for_holdout()
+        holdout_waited, gap_from_previous = await wait_for_holdout()
         req_info.holdout_waited = holdout_waited
         req_info.gap_from_previous = gap_from_previous
-        if last_completion_time > 0:
-            req_info.holdout_compliant = (gap_from_previous + holdout_waited) >= COOLDOWN_BUFFER
+        req_info.holdout_compliant = (gap_from_previous + holdout_waited) >= COOLDOWN_BUFFER if last_completion_time > 0 else None
 
         await enforce_rate_limit()
         await get_concurrency_semaphore().acquire()
