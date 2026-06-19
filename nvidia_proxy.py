@@ -25,7 +25,6 @@ app = FastAPI()
 
 # Global configuration variables managed via command-line arguments
 RATE_LIMIT_REQUESTS = 30
-RATE_LIMIT_WINDOW_SECONDS = 60
 UPSTREAM_TIMEOUT_SECONDS = 500
 MAX_429_RETRIES = 5
 MAX_CONCURRENT_REQUESTS = 1  
@@ -55,22 +54,25 @@ async def release_slot_and_decrement():
     get_concurrency_semaphore().release()
 
 async def enforce_completion_holdout():
-    """Guarantees a strict 2.20s cushion exists between the execution paths of requests."""
+    """Guarantees a strict COOLDOWN_BUFFER cushion between the completion and the next start."""
     global last_completion_time
     now = time.monotonic()
+    elapsed = now - last_completion_time
     
-    if now < last_completion_time:
-        wait_needed = last_completion_time - now
+    if elapsed < COOLDOWN_BUFFER:
+        wait_needed = COOLDOWN_BUFFER - elapsed
         print(f"[pacing-engine] Strict holdout active. Waiting {wait_needed:.2f}s...")
         await asyncio.sleep(wait_needed)
     
-    last_completion_time = time.monotonic() + COOLDOWN_BUFFER
+    last_completion_time = time.monotonic()
 
 
 # --- SPEC-SAFE CONTEXT PRUNING LOGIC ---
-def estimate_tokens(text: str) -> int:
+def estimate_tokens(text) -> int:
     if not text:
         return 0
+    if isinstance(text, list):
+        return sum(estimate_tokens(block.get("text", "")) for block in text if isinstance(block, dict))
     return max(1, len(text) // 4)
 
 def estimate_messages_tokens(messages: list) -> int:
@@ -303,6 +305,7 @@ async def proxy_handler(request: Request, path: str):
         print(f"[proxy] Client disconnected early while waiting in pacing layout.")
         await release_slot_and_decrement()
         req_info.status = "Disconnected"
+        req_info.response_time = round(time.time() - wait_start, 2)
         stats["failed_requests"] += 1
         request_log.append(req_info)
         return Response(status_code=244, content="Client disconnected from proxy channel early.")
@@ -327,12 +330,14 @@ async def proxy_handler(request: Request, path: str):
                 retry_after = min(2 ** attempt, 30)
                 await upstream.aclose()
                 req_info.status = "rate-limited"
+                stats["rate_limited_requests"] += 1
                 print(f"[proxy] NVIDIA 429 encountered; holding {retry_after:.1f}s")
                 await asyncio.sleep(retry_after)
     except Exception as exc:
         await release_slot_and_decrement()
         await client.aclose()
         req_info.status = "failed"
+        req_info.response_time = round(time.time() - wait_start, 2)
         stats["failed_requests"] += 1
         request_log.append(req_info)
         last_completion_time = time.monotonic()
@@ -344,29 +349,27 @@ async def proxy_handler(request: Request, path: str):
         await upstream.aclose()
         await client.aclose()
         req_info.status = "failed"
+        req_info.response_time = round(time.time() - wait_start, 2)
         stats["failed_requests"] += 1
         request_log.append(req_info)
         last_completion_time = time.monotonic()
         return Response(content=err_body, status_code=upstream.status_code)
 
     resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"}
-    finalised = False
 
     async def relay():
         global last_completion_time
-        nonlocal finalised
         try:
             async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
                 async for chunk in upstream.aiter_raw():
                     yield chunk
             req_info.status = "success"
             stats["successful_requests"] += 1
-            finalised = True
         except Exception:
             req_info.status = "failed"
             stats["failed_requests"] += 1
-            finalised = True
         finally:
+            req_info.response_time = round(time.time() - wait_start, 2)
             request_log.append(req_info)
             await upstream.aclose()
             await client.aclose()

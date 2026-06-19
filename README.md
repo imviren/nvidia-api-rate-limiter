@@ -1,16 +1,17 @@
 # NVIDIA API Rate Limiting Proxy
 
-A lightweight reverse proxy that intercepts NVIDIA API calls and applies **completion-based pacing** to stay within NVIDIA rate limits. Includes a real-time WebSocket dashboard.
+A lightweight reverse proxy that intercepts NVIDIA API calls and applies **sequential holdout pacing** to stay within NVIDIA rate limits. Includes a real-time WebSocket dashboard.
 
 ## Features
 
-- **Completion-Based Pacing**: Sliding-window tracker that paces based on when upstream response streams _finish_ (not when requests are sent), preventing 429 drops under multi-channel conditions
-- **Multi-Track Concurrency**: Async semaphore for up to 3 (configurable) parallel streaming requests
-- **429 Retry Logic**: Exponential backoff and automatic retry on NVIDIA rate-limit responses
-- **Context Pruning (Opt-in)**: Optionally prune chat history to stay under token limits — disabled by default to preserve message role hierarchies for agentic workflows
+- **Completion-Based Holdout**: Sequential pacing engine that enforces a configurable cooldown gap (default 1.67s) between request completions, preventing 429 responses
+- **Single-Stream Concurrency**: One request at a time through the upstream to guarantee pacing integrity
+- **429 Retry Logic**: Exponential backoff (up to 5 retries, capped at 30s) on NVIDIA rate-limit responses
+- **Context Pruning (Opt-in)**: Optionally prune chat history to stay under token limits — opt-in via `--no-context-pruning` (default: on with 160K ceiling)
 - **Real-time Dashboard**: Dark-themed web UI with live stats, queue, and request log via WebSocket at `http://127.0.0.1:8000/`
-- **Request Queuing**: Requests wait in queue when the completion ceiling is reached
+- **Request Queuing**: Requests wait in a FIFO queue behind the sequential lock
 - **Live Statistics**: Track total, successful, rate-limited, failed, and context-pruned requests
+- **Client Disconnect Guard**: Graceful handling of early client disconnects without blocking the pacing engine
 
 ## Installation
 
@@ -25,45 +26,47 @@ pip install fastapi uvicorn httpx truststore certifi python-multipart websockets
 
 ## Usage
 
-### Basic Usage (Default: 35 RPM, 3 concurrent)
+### Basic Usage (Default: ~36 RPM, sequential)
 
 ```bash
 python nvidia_proxy.py
 ```
 
-### Custom Rate Limit & Concurrency
+### Custom Port / Timeout
 
 ```bash
-python nvidia_proxy.py --rpm 20 --concurrency 2
+python nvidia_proxy.py --port 8000 --host 127.0.0.1 --timeout 500
 ```
 
 ### Full Options
 
 ```bash
-python nvidia_proxy.py --rpm 30 --port 8000 --host 127.0.0.1 --timeout 500
+python nvidia_proxy.py --rpm 30 --port 8000 --host 127.0.0.1 --timeout 500 --cooldown 1.67
 ```
 
 ## Context Pruning
 
-Context pruning is **disabled by default** to prevent message role corruption in agentic workflows (e.g., OpenCode). Enable it explicitly when needed:
+Context pruning is **enabled by default** (ceiling: 160K tokens) to keep chat history manageable. Disable it when message role integrity is critical:
 
 ```bash
-# Enable context pruning
-python nvidia_proxy.py --context-pruning
+# Disable context pruning
+python nvidia_proxy.py --no-context-pruning
 ```
 
-> **Why disabled by default?** Aggressive truncation can split `assistant` tool-call messages from their corresponding `tool` responses, causing NVIDIA to reject the request with `Unexpected role 'tool' after role 'system'`. For long-running agent sessions, rely on the completion-based pacing engine instead.
+> **Why disable?** Aggressive truncation can split `assistant` tool-call messages from their corresponding `tool` responses, causing NVIDIA to reject the request with `Unexpected role 'tool' after role 'system'`.
 
 ### Command-Line Arguments
 
 | Argument | Short | Default | Description |
 |----------|-------|---------|-------------|
-| `--rpm` | `-r` | 35 | Maximum completed requests per minute |
+| `--rpm` | `-r` | 30 | Target RPM (informational, pacing driven by cooldown) |
 | `--port` | `-p` | 8000 | Port to run the proxy on |
 | `--host` | | 127.0.0.1 | Host to bind to |
 | `--timeout` | `-t` | 500 | Upstream timeout in seconds |
-| `--concurrency` | `-c` | 3 | Maximum concurrent in-flight requests |
-| `--no-context-pruning` | | (default) | Disable context pruning (preserves message integrity) |
+| `--max-context-tokens` | | 160000 | Token ceiling for context pruning |
+| `--keep-last-messages` | | 30 | Messages to preserve when pruning |
+| `--cooldown` | `-c` | 1.67 | Post-completion holdout buffer (seconds) |
+| `--no-context-pruning` | | | Disable context pruning |
 
 ## Configuration
 
@@ -105,31 +108,31 @@ The dashboard displays:
 ## How It Works
 
 1. **Intercept**: OpenCode sends requests to the local proxy instead of directly to NVIDIA
-2. **Queue**: Requests enter a queue and acquire a concurrency semaphore slot
-3. **Pace**: The proxy checks its sliding completion window — if the rolling 60s count of completed + in-flight requests hits the limit, the pipeline delays until a slot opens
-4. **Forward**: Approved requests stream to the NVIDIA API
-5. **Track Completion**: When the upstream response stream fully closes, the completion timestamp is recorded, freeing pacing capacity
+2. **Queue**: Requests enter a FIFO queue behind the sequential lock
+3. **Pace**: A global `asyncio.Lock` ensures only one request passes through the pacing gate at a time. `enforce_completion_holdout()` checks the elapsed time since the last response stream closed — if less than `COOLDOWN_BUFFER` (default 1.67s), it sleeps the difference
+4. **Forward**: Approved requests stream to the NVIDIA API with 429 retry logic (exponential backoff, up to 5 retries, 30s cap)
+5. **Track Completion**: When the upstream response stream fully closes, the completion timestamp is recorded, enabling the next request's holdout calculation
 6. **Dashboard**: All stats are pushed to the browser dashboard via WebSocket every second
 
 ### Architecture
 
 ```
-OpenCode → Queue → Semaphore → Completion Window Gate → NVIDIA API
-                ↕                                      ↓ (on stream close)
+OpenCode → Queue → Sequential Lock → Holdout Gate → NVIDIA API
+                ↕                                    ↓ (on stream close)
            Dashboard ←── WebSocket ←── Stats + Completion Log
 ```
 
 ## Recommended Settings
 
 ```bash
-# Conservative defaults (35 RPM, 3 concurrent)
+# Default (36 RPM throughput, sequential)
 python nvidia_proxy.py
 
-# Lower throughput for safety
-python nvidia_proxy.py --rpm 20 --concurrency 2
+# Tighter cooldown for faster responses (higher 429 risk)
+python nvidia_proxy.py --cooldown 1.0
 
-# Max safety (single file, low RPM)
-python nvidia_proxy.py --rpm 15 --concurrency 1
+# Conservative (lower RPM, max safety)
+python nvidia_proxy.py --cooldown 3.0
 ```
 
 ## Quick Setup (Windows)
@@ -217,17 +220,29 @@ Restart OpenCode GUI for changes to take effect.
 :: Install dependencies
 pip install fastapi uvicorn httpx truststore websockets
 
-:: Run proxy (default 35 RPM, 3 concurrent)
+:: Run proxy (default ~36 RPM, sequential)
 python nvidia_proxy.py
 
 :: Or with custom settings
-python nvidia_proxy.py --rpm 20 --port 8000 --host 127.0.0.1
+python nvidia_proxy.py --rpm 30 --port 8000 --host 127.0.0.1 --cooldown 2.0
 ```
 
 ### 3. Verify Setup
 
 - Dashboard: http://127.0.0.1:8000/
 - Test API: http://127.0.0.1:8000/v1/models
+
+---
+
+## Changelog
+
+### v1.1 — Pacing Engine Fixes
+
+- **Fixed**: Pacing holdout now uses elapsed-time checks (`now - last_completion_time`) instead of future-wall-clock projection. Previously, the relay's completion handler would overwrite the forward-projected holdout time, collapsing the cooldown gap after long requests.
+- **Fixed**: `stats["rate_limited_requests"]` counter is now incremented on each 429 retry (was stuck at 0).
+- **Fixed**: `estimate_tokens()` now handles multi-modal content arrays (`content` as a list, not just a string).
+- **Fixed**: `response_time` is now populated for all request outcomes (success, failure, disconnect).
+- **Removed**: Dead `finalised` variable, dead `RATE_LIMIT_WINDOW_SECONDS` constant.
 
 ---
 

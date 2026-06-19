@@ -17,3 +17,6 @@ Thumbs.db
 venv/
 .venv/
 env/
+
+# Backup copies
+nvidia_proxy - Copy*.py
