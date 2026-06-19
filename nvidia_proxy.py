@@ -34,11 +34,19 @@ inflight_lock = asyncio.Lock()
 concurrency_semaphore = None
 
 SEQUENTIAL_LOCK = asyncio.Lock()
-last_completion_time = 0.0
+last_completion_time = 0.0      # monotonic clock — when the previous request FULLY completed
+last_send_time = 0.0           # monotonic clock — when the previous request was SENT to NVIDIA
 COOLDOWN_BUFFER = 1.67
 CIRCUIT_BREAKER_OPEN = False
 stream_complete_event = asyncio.Event()
 stream_complete_event.set()
+
+def log(msg, req_info=None, tag="proxy"):
+    """Timestamped console logger for pacing/debugging. flush=True so lines
+    appear immediately in the proxy window."""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    rid = f"#{req_info.id} " if req_info is not None else ""
+    print(f"[{ts}] [{tag}] {rid}{msg}", flush=True)
 
 def get_concurrency_semaphore():
     global concurrency_semaphore
@@ -46,36 +54,52 @@ def get_concurrency_semaphore():
         concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     return concurrency_semaphore
 
-async def release_slot_and_decrement():
-    async with inflight_lock:
-        global INFLIGHT_REQUESTS
-        INFLIGHT_REQUESTS = max(0, INFLIGHT_REQUESTS - 1)
+def release_slot_sync():
+    """Release the concurrency slot WITHOUT awaiting. Safe to call from a
+    finally block even while the task is being cancelled — no await means the
+    cancellation cannot interrupt it half-way and leak the slot."""
+    global INFLIGHT_REQUESTS
+    INFLIGHT_REQUESTS = max(0, INFLIGHT_REQUESTS - 1)
     get_concurrency_semaphore().release()
 
-async def wait_for_holdout():
+async def wait_for_holdout(req_info=None):
     """
-    Wait for previous stream to complete, then enforce COOLDOWN_BUFFER holdout.
-    Returns (holdout_waited, gap_from_previous_completion) in seconds.
-    """
-    global last_completion_time
+    Block until it is safe to issue the next NVIDIA request. THREE gates:
+      1) the previous request's response stream has fully completed (event), and
+      2) >= COOLDOWN_BUFFER seconds since the previous COMPLETION, and
+      3) >= COOLDOWN_BUFFER seconds since the previous SEND.
 
+    Gate 3 is the hard anti-429 floor: it guarantees two requests can never hit
+    NVIDIA inside the cooldown window even if completion tracking is ever
+    disturbed (cancelled stream, error path, etc.). We loop because sleeping on
+    one clock can let the other fall behind.
+
+    Returns (total_holdout_waited, gap_since_previous_completion) in seconds.
+    """
+    global last_completion_time, last_send_time
+
+    if not stream_complete_event.is_set():
+        log("previous stream still streaming — waiting for it to finish before pacing", req_info, tag="pacing")
     await stream_complete_event.wait()
 
-    now = time.monotonic()
-    gap = now - last_completion_time
-
-    if gap < COOLDOWN_BUFFER:
-        wait_needed = COOLDOWN_BUFFER - gap
-        print(f"[pacing-engine] Strict holdout active. Waiting {wait_needed:.2f}s...")
+    total_waited = 0.0
+    while True:
+        now = time.monotonic()
+        gap_completion = (now - last_completion_time) if last_completion_time > 0 else COOLDOWN_BUFFER
+        gap_send = (now - last_send_time) if last_send_time > 0 else COOLDOWN_BUFFER
+        wait_needed = max(COOLDOWN_BUFFER - gap_completion, COOLDOWN_BUFFER - gap_send)
+        if wait_needed <= 0.0005:
+            return total_waited, gap_completion
+        log(f"holdout: sleeping {wait_needed:.3f}s "
+            f"(since completion {gap_completion:.3f}s / since send {gap_send:.3f}s, need {COOLDOWN_BUFFER}s)",
+            req_info, tag="pacing")
         await asyncio.sleep(wait_needed)
-        return wait_needed, gap
-
-    return 0.0, gap
+        total_waited += wait_needed
 
 rate_limit_window = deque()
 rate_limit_lock = asyncio.Lock()
 
-async def enforce_rate_limit():
+async def enforce_rate_limit(req_info=None):
     while True:
         async with rate_limit_lock:
             now = time.monotonic()
@@ -84,6 +108,8 @@ async def enforce_rate_limit():
             if len(rate_limit_window) < RATE_LIMIT_REQUESTS:
                 return
             wait = rate_limit_window[0] + 60 - now
+        log(f"RPM window full ({len(rate_limit_window)}/{RATE_LIMIT_REQUESTS} in 60s) — waiting {min(wait, 1.0):.2f}s",
+            req_info, tag="rpm")
         await asyncio.sleep(min(wait, 1.0))
 
 async def record_rate_limit_usage():
@@ -360,12 +386,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_handler(request: Request, path: str):
-    global last_completion_time, CIRCUIT_BREAKER_OPEN
+    global last_completion_time, last_send_time, CIRCUIT_BREAKER_OPEN, INFLIGHT_REQUESTS
     if request.method == "OPTIONS":
         return Response(status_code=204)
 
     if CIRCUIT_BREAKER_OPEN:
-        print(f"[circuit-breaker] REJECTED {request.method} /{path} — proxy locked")
+        log(f"REJECTED {request.method} /{path} — circuit breaker OPEN (proxy locked)", tag="circuit-breaker")
         return Response(content='{"error":"Proxy locked — NVIDIA rate-limited previously. Restart proxy to retry."}', status_code=429, media_type="application/json")
 
     stats["total_requests"] += 1
@@ -373,142 +399,160 @@ async def proxy_handler(request: Request, path: str):
 
     async with queue_lock:
         queue.append(req_info)
+    log(f"RECEIVED {request.method} /{path}  (queue depth: {len(queue)})", req_info)
 
     wait_start = time.time()
 
     async with SEQUENTIAL_LOCK:
-        holdout_waited, gap_from_previous = await wait_for_holdout()
+        # ---- PACING GATE: previous stream done + cooldown since completion AND since last send ----
+        holdout_waited, gap_from_completion = await wait_for_holdout(req_info)
         req_info.holdout_waited = holdout_waited
-        req_info.gap_from_previous = gap_from_previous
-        req_info.holdout_compliant = (gap_from_previous + holdout_waited) >= COOLDOWN_BUFFER if last_completion_time > 0 else None
+        req_info.gap_from_previous = gap_from_completion
 
-        await enforce_rate_limit()
+        await enforce_rate_limit(req_info)
         await get_concurrency_semaphore().acquire()
+        INFLIGHT_REQUESTS += 1
 
         req_info.wait_time = round(time.time() - wait_start, 2)
-
-        async with inflight_lock:
-            global INFLIGHT_REQUESTS
-            INFLIGHT_REQUESTS += 1
 
         async with queue_lock:
             if req_info in queue:
                 queue.remove(req_info)
 
+        upstream = None
+        handed_off_to_relay = False
         try:
-            body = await request.body()
-            body = await maybe_prune_chat_context(body, f"/{path}")
-        except ClientDisconnect:
-            req_info.request_complete_time = datetime.now().isoformat()
-            req_info.response_time = round(time.time() - wait_start, 2)
-            req_info.status = "Disconnected"
-            stats["failed_requests"] += 1
-            request_log.append(req_info)
-            await release_slot_and_decrement()
-            last_completion_time = time.monotonic()
-            return Response(status_code=244, content="Client disconnected from proxy channel early.")
+            try:
+                body = await request.body()
+                body = await maybe_prune_chat_context(body, f"/{path}")
+            except ClientDisconnect:
+                req_info.status = "Disconnected"
+                stats["failed_requests"] += 1
+                log("client disconnected before send — no NVIDIA call made", req_info, tag="disconnect")
+                return Response(status_code=244, content="Client disconnected from proxy channel early.")
 
-        fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host",)}
-        fwd_headers["host"] = "integrate.api.nvidia.com"
-        if body:
-            fwd_headers["content-length"] = str(len(body))
+            fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host",)}
+            fwd_headers["host"] = "integrate.api.nvidia.com"
+            if body:
+                fwd_headers["content-length"] = str(len(body))
 
-        target_url = f"{NVIDIA_BASE_URL}/{path}"
-        if request.url.query:
-            target_url += f"?{request.url.query}"
+            target_url = f"{NVIDIA_BASE_URL}/{path}"
+            if request.url.query:
+                target_url += f"?{request.url.query}"
 
-        client = await get_shared_client()
+            client = await get_shared_client()
 
-        try:
-            async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
-                upstream_req = client.build_request(method=request.method, url=target_url, headers=fwd_headers, content=body)
-                req_info.request_sent_time = datetime.now().isoformat()
-                upstream = await client.send(upstream_req, stream=True)
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, ssl.SSLError) as exc:
-            req_info.request_complete_time = datetime.now().isoformat()
-            req_info.response_time = round(time.time() - wait_start, 2)
-            req_info.status = "failed"
-            stats["failed_requests"] += 1
-            request_log.append(req_info)
-            await release_slot_and_decrement()
-            last_completion_time = time.monotonic()
-            print(f"[proxy] Network error: {type(exc).__name__}: {exc}")
-            return Response(content=f"NVIDIA connection failed: {type(exc).__name__}", status_code=502)
-        except asyncio.TimeoutError:
-            req_info.request_complete_time = datetime.now().isoformat()
-            req_info.response_time = round(time.time() - wait_start, 2)
-            req_info.status = "failed"
-            stats["failed_requests"] += 1
-            request_log.append(req_info)
-            await release_slot_and_decrement()
-            last_completion_time = time.monotonic()
-            print(f"[proxy] Upstream timeout after {UPSTREAM_TIMEOUT_SECONDS}s")
-            return Response(content="NVIDIA upstream timeout", status_code=504)
-        except Exception as exc:
-            req_info.request_complete_time = datetime.now().isoformat()
-            req_info.response_time = round(time.time() - wait_start, 2)
-            req_info.status = "failed"
-            stats["failed_requests"] += 1
-            request_log.append(req_info)
-            await release_slot_and_decrement()
-            last_completion_time = time.monotonic()
-            print(f"[proxy] Upstream error: {type(exc).__name__}: {exc}")
-            return Response(content=f"NVIDIA upstream error: {type(exc).__name__}", status_code=502)
+            # ---- record the SEND moment and the REAL gaps (this is the anti-429 invariant) ----
+            now_send = time.monotonic()
+            gap_since_send = (now_send - last_send_time) if last_send_time > 0 else None
+            gap_since_completion = (now_send - last_completion_time) if last_completion_time > 0 else None
+            last_send_time = now_send
+            req_info.holdout_compliant = None if gap_since_send is None else (gap_since_send >= COOLDOWN_BUFFER - 0.01)
+            req_info.request_sent_time = datetime.now().isoformat()
 
-        if upstream.status_code == 429:
-            CIRCUIT_BREAKER_OPEN = True
-            req_info.request_complete_time = datetime.now().isoformat()
-            req_info.response_time = round(time.time() - wait_start, 2)
-            req_info.status = "rate-limited"
-            stats["rate_limited_requests"] += 1
-            request_log.append(req_info)
-            try: err_body = await upstream.aread()
-            except Exception: err_body = b""
-            await upstream.aclose()
-            await release_slot_and_decrement()
-            last_completion_time = time.monotonic()
-            print(f"[circuit-breaker] NVIDIA 429 — locking proxy until restart")
-            return Response(content=err_body, status_code=429)
+            gs = f"{gap_since_send:.3f}s" if gap_since_send is not None else "n/a (first request)"
+            gc = f"{gap_since_completion:.3f}s" if gap_since_completion is not None else "n/a (first request)"
+            log(f"→ SENDING to NVIDIA  {request.method} /{path}  "
+                f"gap_since_prev_SEND={gs}  gap_since_prev_COMPLETION={gc}  queued_for={req_info.wait_time}s",
+                req_info, tag="send")
+            if gap_since_send is not None and gap_since_send < COOLDOWN_BUFFER - 0.01:
+                log(f"!! SPACING VIOLATION: only {gap_since_send:.3f}s since previous send (need {COOLDOWN_BUFFER}s)",
+                    req_info, tag="WARN")
 
-        if upstream.status_code >= 400:
-            req_info.request_complete_time = datetime.now().isoformat()
-            req_info.response_time = round(time.time() - wait_start, 2)
-            req_info.status = "failed"
-            stats["failed_requests"] += 1
-            request_log.append(req_info)
-            try: err_body = await upstream.aread()
-            except Exception: err_body = b""
-            await upstream.aclose()
-            await release_slot_and_decrement()
-            last_completion_time = time.monotonic()
-            return Response(content=err_body, status_code=upstream.status_code)
-
-        resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"}
-        await record_rate_limit_usage()
-
-        stream_complete_event.clear()
-
-        async def relay():
             try:
                 async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
-                    async for chunk in upstream.aiter_raw():
-                        yield chunk
-                req_info.status = "success"
-                stats["successful_requests"] += 1
-            except Exception:
+                    upstream_req = client.build_request(method=request.method, url=target_url, headers=fwd_headers, content=body)
+                    upstream = await client.send(upstream_req, stream=True)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, ssl.SSLError) as exc:
                 req_info.status = "failed"
                 stats["failed_requests"] += 1
-            finally:
-                req_info.request_complete_time = datetime.now().isoformat()
-                req_info.response_time = round(time.time() - wait_start, 2)
-                request_log.append(req_info)
-                await upstream.aclose()
-                await release_slot_and_decrement()
-                global last_completion_time
-                last_completion_time = time.monotonic()
-                stream_complete_event.set()
+                log(f"network error: {type(exc).__name__}: {exc}", req_info, tag="error")
+                return Response(content=f"NVIDIA connection failed: {type(exc).__name__}", status_code=502)
+            except asyncio.TimeoutError:
+                req_info.status = "failed"
+                stats["failed_requests"] += 1
+                log(f"upstream connect timeout after {UPSTREAM_TIMEOUT_SECONDS}s", req_info, tag="error")
+                return Response(content="NVIDIA upstream timeout", status_code=504)
+            except Exception as exc:
+                req_info.status = "failed"
+                stats["failed_requests"] += 1
+                log(f"upstream error: {type(exc).__name__}: {exc}", req_info, tag="error")
+                return Response(content=f"NVIDIA upstream error: {type(exc).__name__}", status_code=502)
 
-        return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
+            log(f"NVIDIA responded status={upstream.status_code}", req_info, tag="recv")
+
+            if upstream.status_code == 429:
+                CIRCUIT_BREAKER_OPEN = True
+                req_info.status = "rate-limited"
+                stats["rate_limited_requests"] += 1
+                try: err_body = await upstream.aread()
+                except Exception: err_body = b""
+                log("NVIDIA returned 429 — locking proxy (circuit breaker) until restart", req_info, tag="circuit-breaker")
+                return Response(content=err_body, status_code=429)
+
+            if upstream.status_code >= 400:
+                req_info.status = "failed"
+                stats["failed_requests"] += 1
+                try: err_body = await upstream.aread()
+                except Exception: err_body = b""
+                log(f"NVIDIA error status={upstream.status_code}", req_info, tag="error")
+                return Response(content=err_body, status_code=upstream.status_code)
+
+            resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"}
+            await record_rate_limit_usage()
+
+            stream_complete_event.clear()   # close the pacing gate; relay() re-opens it
+            handed_off_to_relay = True       # relay() now owns slot release + gate re-open
+
+            async def relay():
+                global last_completion_time
+                try:
+                    async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
+                        async for chunk in upstream.aiter_raw():
+                            yield chunk
+                    req_info.status = "success"
+                    stats["successful_requests"] += 1
+                except Exception as exc:
+                    req_info.status = "failed"
+                    stats["failed_requests"] += 1
+                    log(f"stream relay error: {type(exc).__name__}: {exc}", req_info, tag="error")
+                finally:
+                    # --- cancellation-PROOF critical section: no awaits before the gate re-opens ---
+                    release_slot_sync()
+                    last_completion_time = time.monotonic()
+                    stream_complete_event.set()                 # re-open the pacing gate
+                    req_info.request_complete_time = datetime.now().isoformat()
+                    req_info.response_time = round(time.time() - wait_start, 2)
+                    request_log.append(req_info)
+                    log(f"✓ COMPLETED  status={req_info.status}  duration={req_info.response_time}s  "
+                        f"(next send gated +{COOLDOWN_BUFFER}s)", req_info, tag="done")
+                    # awaitable cleanup LAST — safe even if interrupted; gate is already open
+                    try:
+                        await upstream.aclose()
+                    except BaseException:
+                        pass
+
+            return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
+
+        finally:
+            if not handed_off_to_relay:
+                # Request never started streaming (error / disconnect / cancellation).
+                # Release the slot, re-open the pacing gate, and stamp completion so the
+                # NEXT request paces from now. All synchronous => cancellation-proof.
+                release_slot_sync()
+                last_completion_time = time.monotonic()
+                # the event is only cleared on the success path, so the gate is still open here
+                if req_info.request_complete_time is None:
+                    req_info.request_complete_time = datetime.now().isoformat()
+                if req_info.response_time is None:
+                    req_info.response_time = round(time.time() - wait_start, 2)
+                if req_info not in request_log:
+                    request_log.append(req_info)
+                if upstream is not None:
+                    try:
+                        await upstream.aclose()
+                    except BaseException:
+                        pass
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -545,7 +589,8 @@ def main():
     print(f"  Running on:         http://{args.host}:{args.port}/")
     print(f"  Rate Limit:         {RATE_LIMIT_REQUESTS} RPM (sliding window)")
     print(f"  Cooldown Buffer:    {COOLDOWN_BUFFER}s")
-    print(f"  Stream Gating:      Next request blocked until stream finishes + holdout")
+    print(f"  Pacing Gates:       (1) prev stream finished  (2) >={COOLDOWN_BUFFER}s since completion  (3) >={COOLDOWN_BUFFER}s since send")
+    print(f"  Console Logging:    Per-request RECEIVED / SEND / RECV / COMPLETED with timestamps + real gaps")
     print(f"  Pruning Logic:      Enabled (Ceiling: {MAX_CONTEXT_TOKENS} tokens)")
     print(f"  Message Window:     Always preserve last {KEEP_LAST_MESSAGES} loops")
     print(f"  429 Handling:       Hard circuit breaker — locks proxy on first 429")

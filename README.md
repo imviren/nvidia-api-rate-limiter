@@ -241,6 +241,14 @@ python nvidia_proxy.py --rpm 30 --port 8000 --host 127.0.0.1 --cooldown 2.0
 
 ## Changelog
 
+### v3.1 — Pacing Hardening + Full Console Tracing
+
+- **Fixed (CRITICAL — slip):** Added a **send-side floor**. Spacing was enforced only off the completion event; if completion tracking was ever disturbed (a cancelled stream, an error path), two requests could hit NVIDIA inside the 1.67s window. `wait_for_holdout()` now enforces **three** gates: (1) previous stream finished, (2) ≥cooldown since previous *completion*, (3) ≥cooldown since previous *send*. Gate 3 makes the 1.67s spacing impossible to bypass.
+- **Fixed (CRITICAL — hang/leak):** The `relay()` `finally` did `await upstream.aclose()` / `await release_slot_and_decrement()` **before** re-opening the pacing gate. When a client aborted a stream mid-flight, the `CancelledError` could interrupt those awaits and skip `stream_complete_event.set()`, wedging the gate (or leaking the concurrency slot). The critical section is now fully **synchronous** (`release_slot_sync()` + gate re-open) with awaitable cleanup moved last.
+- **Fixed:** Cancelled/errored requests now release the concurrency slot via a guaranteed `finally`, so the slot can never leak.
+- **Fixed:** `holdout_compliant` was tautologically always `true` (it measured the proxy's own computed gap). It now measures the **real wall-clock gap between consecutive sends** — so the dashboard's "Holdout FAIL" counter can actually surface a slip, and the console prints a `!! SPACING VIOLATION` line if one ever occurs.
+- **New:** **Full timestamped console tracing.** Every request prints `RECEIVED → [holdout] → SEND (with gap_since_prev_SEND / gap_since_prev_COMPLETION) → RECV status → COMPLETED (duration)`. Run the proxy in its own window to watch real pacing.
+
 ### v1.6 — Audit Fixes + Connection Pooling
 
 - **Fixed**: 429 retries now **re-check holdout** before each attempt — previously bursts could trigger more 429s
