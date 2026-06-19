@@ -5,6 +5,7 @@ from datetime import datetime
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.websockets import WebSocketDisconnect
+from starlette.requests import ClientDisconnect
 import httpx
 import uvicorn
 import ssl
@@ -36,10 +37,10 @@ INFLIGHT_REQUESTS = 0
 inflight_lock = asyncio.Lock()
 concurrency_semaphore = None
 
-# --- AIR-TIGHT FIXED PACING ENGINE STATE ---
+# --- AIR-TIGHT PACING ENGINE STATE ---
 SEQUENTIAL_LOCK = asyncio.Lock()
-last_completion_time = time.monotonic()  
-COOLDOWN_BUFFER = 2.20  
+last_completion_time = 0.0  
+COOLDOWN_BUFFER = 1.67  
 
 def get_concurrency_semaphore():
     global concurrency_semaphore
@@ -54,18 +55,16 @@ async def release_slot_and_decrement():
     get_concurrency_semaphore().release()
 
 async def enforce_completion_holdout():
-    """Guarantees a strict minimum gap of 2.20s has passed since the last completion closed."""
+    """Guarantees a strict 2.20s cushion exists between the execution paths of requests."""
     global last_completion_time
     now = time.monotonic()
-    elapsed = now - last_completion_time
     
-    if elapsed < COOLDOWN_BUFFER:
-        wait_needed = COOLDOWN_BUFFER - elapsed
-        print(f"[pacing-engine] Strict holdout active. Waiting {wait_needed:.2f}s after previous completion...")
+    if now < last_completion_time:
+        wait_needed = last_completion_time - now
+        print(f"[pacing-engine] Strict holdout active. Waiting {wait_needed:.2f}s...")
         await asyncio.sleep(wait_needed)
     
-    # Set the predictive baseline to the current time AFTER any required sleep concludes
-    last_completion_time = time.monotonic()
+    last_completion_time = time.monotonic() + COOLDOWN_BUFFER
 
 
 # --- SPEC-SAFE CONTEXT PRUNING LOGIC ---
@@ -83,7 +82,6 @@ def estimate_messages_tokens(messages: list) -> int:
     return total
 
 def safe_prune_chat_messages(messages: list, max_tokens: int, keep_last: int) -> list:
-    """Prunes messages to stay under the TPM token limit without breaking role orders."""
     if not messages or estimate_messages_tokens(messages) <= max_tokens:
         return messages
     
@@ -93,23 +91,17 @@ def safe_prune_chat_messages(messages: list, max_tokens: int, keep_last: int) ->
     if len(other_messages) <= keep_last:
         return messages
         
-    # Start by taking the requested trailing window slice
     sliced_messages = other_messages[-keep_last:]
     
-    # CRITICAL SECURITY FIX: Never allow a 'tool' role to be the very first 
-    # message in our chopped conversation array. If it is a tool message, 
-    # look backwards and pull in its associated assistant call.
     while sliced_messages and sliced_messages[0].get("role") == "tool":
         current_idx_in_original = len(other_messages) - len(sliced_messages)
         if current_idx_in_original > 0:
-            # Prepend the preceding message (the assistant frame)
             sliced_messages.insert(0, other_messages[current_idx_in_original - 1])
         else:
             break
             
     final_messages = system_messages + sliced_messages
     
-    # If it is still over budget after slicing, truncate more aggressively recursively
     if estimate_messages_tokens(final_messages) > max_tokens and keep_last > 2:
         return safe_prune_chat_messages(messages, max_tokens, keep_last - 2)
         
@@ -199,14 +191,14 @@ async def dashboard(request: Request):
         .section { background: rgba(255, 255, 255, 0.05); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
         table { width: 100%; border-collapse: collapse; }
         th, td { text-align: left; padding: 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); }
-        .status-queued { color: #00aaff; } .status-forwarding { color: #00ff88; } .status-success { color: #00ff88; } .status-failed { color: #ff4444; }
+        .status-queued { color: #00aaff; } .status-forwarding { color: #00ff88; } .status-success { color: #00ff88; } .status-failed { color: #ff4444; } .status-disconnected { color: #ffaa00; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>NVIDIA API Token & Pacing Monitor</h1>
         <div class="rate-limit-info">
-            <div><h3>Pacing Layout</h3><div class="limit">Sequential Fixed Cooldown</div></div>
+            <div><h3>Pacing Layout</h3><div class="limit">Sequential Predictive Window</div></div>
             <div><h3>Active Connections</h3><div class="limit" id="concurrencyDisplay">0 / 1</div></div>
             <div><h3>Current Window RPM</h3><div class="limit" id="currentRpmDisplay">0</div></div>
         </div>
@@ -278,14 +270,14 @@ async def proxy_handler(request: Request, path: str):
 
     wait_start = time.time()
     
-    # 1. Acquire the lock to cleanly control request sequencing
+    # 1. Acquire sequential queue path positioning lock
     await SEQUENTIAL_LOCK.acquire()
     
     try:
-        # 2. Enforce the time pacing delay window cleanly
+        # 2. Process our holdout parameters
         await enforce_completion_holdout()
         
-        # 3. Secure connection slot allocation marker
+        # 3. Secure slot allocation marker
         await get_concurrency_semaphore().acquire()
         
         req_info.wait_time = round(time.time() - wait_start, 2)
@@ -300,12 +292,21 @@ async def proxy_handler(request: Request, path: str):
         req_info.status = "forwarding"
 
     finally:
-        # RELEASE IMMEDIATELY AFTER STEP 3: Decouples the lock from long streaming download times!
+        # Release lock immediately so backlogged lines can calculate their future delta frames safely
         SEQUENTIAL_LOCK.release()
 
-    body = await request.body()
-    body = await maybe_prune_chat_context(body, f"/{path}")
-    
+    # --- PROTECTED INBOUND CLIENT DISCONNECT GUARD BLOCK ---
+    try:
+        body = await request.body()
+        body = await maybe_prune_chat_context(body, f"/{path}")
+    except ClientDisconnect:
+        print(f"[proxy] Client disconnected early while waiting in pacing layout.")
+        await release_slot_and_decrement()
+        req_info.status = "Disconnected"
+        stats["failed_requests"] += 1
+        request_log.append(req_info)
+        return Response(status_code=244, content="Client disconnected from proxy channel early.")
+
     fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host", "content-length")}
     fwd_headers["host"] = "integrate.api.nvidia.com"
 
@@ -370,8 +371,6 @@ async def proxy_handler(request: Request, path: str):
             await upstream.aclose()
             await client.aclose()
             await release_slot_and_decrement()
-            
-            # Reset completion time marker to track exactly when connection closed!
             last_completion_time = time.monotonic()
 
     return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
