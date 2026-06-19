@@ -71,7 +71,7 @@ async def wait_for_holdout_and_record_completion():
         await asyncio.sleep(wait_needed)
     
     def record_completion():
-        nonlocal last_completion_time
+        global last_completion_time
         last_completion_time = time.monotonic()
     
     return record_completion
