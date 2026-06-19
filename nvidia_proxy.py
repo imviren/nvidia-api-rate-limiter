@@ -12,7 +12,7 @@ from collections import deque
 import uuid
 import json
 
-# TLS trust handling for environments with antivirus interception
+# TLS trust override for environments utilizing antivirus certificate interception
 try:
     import truststore
     SSL_CONTEXT = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -23,20 +23,22 @@ except Exception:
 app = FastAPI()
 
 # Global configuration variables
-RATE_LIMIT_REQUESTS = 35
+RATE_LIMIT_REQUESTS = 30
 RATE_LIMIT_WINDOW_SECONDS = 60
 UPSTREAM_TIMEOUT_SECONDS = 500
 MAX_429_RETRIES = 5
-MAX_CONCURRENT_REQUESTS = 3
+MAX_CONCURRENT_REQUESTS = 1  # Sequential mode forces 1 track
 ENABLE_CONTEXT_PRUNING = False
 
 INFLIGHT_REQUESTS = 0
 inflight_lock = asyncio.Lock()
 concurrency_semaphore = None
 
-# Sliding window history for connection closures
-completed_timestamps = deque()
-completion_lock = asyncio.Lock()
+# --- NEW SEQUENTIAL COMPLETION + HOLDOUT ENGINE STATE ---
+# This single lock guarantees that request B cannot leave the machine until request A finishes entirely.
+SEQUENTIAL_LOCK = asyncio.Lock()
+last_completion_time = 0.0
+COOLDOWN_BUFFER = 2.20  # 2.2-second absolute holdout after completion
 
 def get_concurrency_semaphore():
     global concurrency_semaphore
@@ -44,44 +46,26 @@ def get_concurrency_semaphore():
         concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     return concurrency_semaphore
 
-async def record_completion():
-    """Records the exact millisecond a request closes its stream to update the window."""
-    async with completion_lock:
-        completed_timestamps.append(time.monotonic())
-    
+async def release_slot_and_decrement():
     async with inflight_lock:
         global INFLIGHT_REQUESTS
         INFLIGHT_REQUESTS = max(0, INFLIGHT_REQUESTS - 1)
     get_concurrency_semaphore().release()
 
-async def wait_for_completion_window():
-    """Blocks the request pipeline dynamically if the completion-based ceiling is met."""
-    while True:
-        now = time.monotonic()
-        
-        async with completion_lock:
-            # Drop entries older than 60 seconds
-            while completed_timestamps and completed_timestamps[0] < (now - 60.0):
-                completed_timestamps.popleft()
-            recent_completed = len(completed_timestamps)
-
-        async with inflight_lock:
-            current_active = INFLIGHT_REQUESTS
-
-        total_tracked_load = recent_completed + current_active
-
-        if total_tracked_load < RATE_LIMIT_REQUESTS:
-            return  # Within safety threshold
-        
-        async with completion_lock:
-            if completed_timestamps:
-                oldest_completion = completed_timestamps[0]
-                sleep_needed = max(0.1, (oldest_completion + 60.0) - now)
-            else:
-                sleep_needed = 1.0
-
-        print(f"[pacing-engine] Capped by completed RPM. Delaying execution path for {sleep_needed:.2f}s...")
-        await asyncio.sleep(sleep_needed)
+async def enforce_completion_holdout():
+    """
+    Ensures that a strict minimum gap of 2.20 seconds has passed 
+    since the previous request completely finished and closed out.
+    """
+    global last_completion_time
+    
+    now = time.monotonic()
+    elapsed = now - last_completion_time
+    
+    if elapsed < COOLDOWN_BUFFER:
+        wait_needed = COOLDOWN_BUFFER - elapsed
+        print(f"[pacing-engine] Strict holdout active. Waiting {wait_needed:.2f}s after previous completion...")
+        await asyncio.sleep(wait_needed)
 
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com"
@@ -123,14 +107,13 @@ def get_current_rpm():
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    """Serve the fully styled interactive web dashboard interface."""
     html_content = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NVIDIA API Rate Limit Proxy</title>
+    <title>NVIDIA Proxy (Completion Holdout Mode)</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -169,19 +152,19 @@ async def dashboard(request: Request):
 </head>
 <body>
     <div class="container">
-        <h1><span class="live-indicator"></span>NVIDIA API Rate Limit Proxy</h1>
+        <h1><span class="live-indicator"></span>NVIDIA Rate Limit Proxy</h1>
         
         <div class="rate-limit-info">
             <div>
-                <h2>Rate Limit Configuration</h2>
-                <div class="limit" id="rateLimitDisplay">-- RPM</div>
+                <h2>Pacing Protocol</h2>
+                <div class="limit">Sequential + 2.2s Cooldown</div>
             </div>
             <div style="text-align: center;">
-                <h2>Concurrency</h2>
-                <div class="limit" id="concurrencyDisplay">0 / 3</div>
+                <h2>Active Concurrency</h2>
+                <div class="limit" id="concurrencyDisplay">0 / 1</div>
             </div>
             <div style="text-align: right;">
-                <h2>Current RPM</h2>
+                <h2>Current RPM Window</h2>
                 <div class="limit" id="currentRpmDisplay">0</div>
             </div>
         </div>
@@ -223,7 +206,6 @@ async def dashboard(request: Request):
         }
         
         function updateDashboard(data) {
-            document.getElementById('rateLimitDisplay').textContent = `${data.rate_limit_rpm} RPM`;
             document.getElementById('currentRpmDisplay').textContent = data.current_rpm;
             document.getElementById('concurrencyDisplay').textContent = `${data.current_inflight} / ${data.max_concurrency}`;
             document.getElementById('totalRequests').textContent = data.stats.total_requests;
@@ -279,6 +261,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_handler(request: Request, path: str):
+    global last_completion_time
     stats["total_requests"] += 1
     req_info = RequestInfo(request.method, f"/{path}")
     print(f"[proxy] intercepted {request.method} /{path}")
@@ -289,95 +272,119 @@ async def proxy_handler(request: Request, path: str):
 
     wait_start = time.time()
     
-    # Establish concurrency seat placement
-    await get_concurrency_semaphore().acquire()
-    
-    # Apply modern dynamic completion padding
-    await wait_for_completion_window()
-    
-    req_info.wait_time = round(time.time() - wait_start, 2)
-
-    async with inflight_lock:
-        global INFLIGHT_REQUESTS
-        INFLIGHT_REQUESTS += 1
-        
-    async with queue_lock:
-        if req_info in queue:
-            queue.remove(req_info)
-    req_info.status = "forwarding"
-
-    body = await request.body()
-    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host", "content-length")}
-    fwd_headers["host"] = "integrate.api.nvidia.com"
-
-    target_url = f"{NVIDIA_BASE_URL}/{path}"
-    if request.url.query:
-        target_url += f"?{request.url.query}"
-
-    client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=UPSTREAM_TIMEOUT_SECONDS), verify=SSL_CONTEXT)
-    request_start = time.time()
+    # 1. Acquire the strict single-file sequential execution block
+    await SEQUENTIAL_LOCK.acquire()
     
     try:
-        async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
-            for attempt in range(MAX_429_RETRIES + 1):
-                upstream_req = client.build_request(method=request.method, url=target_url, headers=fwd_headers, content=body)
-                upstream = await client.send(upstream_req, stream=True)
-                if upstream.status_code != 429 or attempt == MAX_429_RETRIES:
-                    break
-                retry_after = min(2 ** attempt, 30)
-                await upstream.aclose()
-                req_info.status = "rate-limited"
-                print(f"[proxy] NVIDIA 429 encountered; holding {retry_after:.1f}s")
-                await asyncio.sleep(retry_after)
-    except Exception as exc:
-        await record_completion()
-        await client.aclose()
-        req_info.status = "failed"
-        stats["failed_requests"] += 1
-        request_log.append(req_info)
-        return Response(content=f"Error connecting to NVIDIA backend: {exc}", status_code=502)
+        # 2. Force the request to wait until 2.20s have passed since the last completion
+        await enforce_completion_holdout()
+        
+        # 3. Secure our active network slot tracker placement
+        await get_concurrency_semaphore().acquire()
+        
+        req_info.wait_time = round(time.time() - wait_start, 2)
 
-    if upstream.status_code >= 400:
-        await record_completion()
-        err_body = await upstream.aread()
-        await upstream.aclose()
-        await client.aclose()
-        req_info.status = "failed"
-        stats["failed_requests"] += 1
-        request_log.append(req_info)
-        return Response(content=err_body, status_code=upstream.status_code)
+        async with inflight_lock:
+            global INFLIGHT_REQUESTS
+            INFLIGHT_REQUESTS += 1
+            
+        async with queue_lock:
+            if req_info in queue:
+                queue.remove(req_info)
+        req_info.status = "forwarding"
 
-    resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"}
-    finalised = False
+        body = await request.body()
+        fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host", "content-length")}
+        fwd_headers["host"] = "integrate.api.nvidia.com"
 
-    async def relay():
-        nonlocal finalised
+        target_url = f"{NVIDIA_BASE_URL}/{path}"
+        if request.url.query:
+            target_url += f"?{request.url.query}"
+
+        client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=UPSTREAM_TIMEOUT_SECONDS), verify=SSL_CONTEXT)
+        request_start = time.time()
+        
         try:
             async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
-                async for chunk in upstream.aiter_raw():
-                    yield chunk
-            req_info.status = "success"
-            stats["successful_requests"] += 1
-            finalised = True
-        except Exception:
+                for attempt in range(MAX_429_RETRIES + 1):
+                    upstream_req = client.build_request(method=request.method, url=target_url, headers=fwd_headers, content=body)
+                    upstream = await client.send(upstream_req, stream=True)
+                    if upstream.status_code != 429 or attempt == MAX_429_RETRIES:
+                        break
+                    retry_after = min(2 ** attempt, 30)
+                    await upstream.aclose()
+                    req_info.status = "rate-limited"
+                    print(f"[proxy] NVIDIA 429 encountered; holding {retry_after:.1f}s")
+                    await asyncio.sleep(retry_after)
+        except Exception as exc:
+            await release_slot_and_decrement()
+            await client.aclose()
             req_info.status = "failed"
             stats["failed_requests"] += 1
-            finalised = True
-        finally:
             request_log.append(req_info)
+            
+            # Request failed to connect, register completion time and release the main lock
+            last_completion_time = time.monotonic()
+            SEQUENTIAL_LOCK.release()
+            return Response(content=f"Error connecting to NVIDIA backend: {exc}", status_code=502)
+
+        if upstream.status_code >= 400:
+            await release_slot_and_decrement()
+            err_body = await upstream.aread()
             await upstream.aclose()
             await client.aclose()
-            await record_completion()
+            req_info.status = "failed"
+            stats["failed_requests"] += 1
+            request_log.append(req_info)
+            
+            # Connection rejected, register completion time and release the main lock
+            last_completion_time = time.monotonic()
+            SEQUENTIAL_LOCK.release()
+            return Response(content=err_body, status_code=upstream.status_code)
 
-    return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
+        resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"}
+        finalised = False
+
+        async def relay():
+            global last_completion_time
+            nonlocal finalised
+            try:
+                async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
+                    async for chunk in upstream.aiter_raw():
+                        yield chunk
+                req_info.status = "success"
+                stats["successful_requests"] += 1
+                finalised = True
+            except Exception:
+                req_info.status = "failed"
+                stats["failed_requests"] += 1
+                finalised = True
+            finally:
+                request_log.append(req_info)
+                await upstream.aclose()
+                await client.aclose()
+                await release_slot_and_decrement()
+                
+                # CRITICAL: Stream is entirely terminated and empty. 
+                # Mark the completion time and unlock the pipeline for the next request.
+                last_completion_time = time.monotonic()
+                SEQUENTIAL_LOCK.release()
+
+        return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
+
+    except Exception as e:
+        # Fallback safeguard lock release
+        if SEQUENTIAL_LOCK.locked():
+            last_completion_time = time.monotonic()
+            SEQUENTIAL_LOCK.release()
+        raise e
 
 def main():
-    parser = argparse.ArgumentParser(description="NVIDIA API Rate Limiting Proxy")
-    parser.add_argument("--rpm", "-r", type=int, default=35)
+    parser = argparse.ArgumentParser(description="NVIDIA API Rate Limiting Proxy (Completion-Paced Engine)")
+    parser.add_argument("--rpm", "-r", type=int, default=30)
     parser.add_argument("--port", "-p", type=int, default=8000)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--timeout", "-t", type=int, default=500)
-    parser.add_argument("--concurrency", "-c", type=int, default=3)
     parser.add_argument("--no-context-pruning", dest="context_pruning", action="store_false")
     parser.set_defaults(context_pruning=False)
 
@@ -386,15 +393,15 @@ def main():
     global RATE_LIMIT_REQUESTS, UPSTREAM_TIMEOUT_SECONDS, MAX_CONCURRENT_REQUESTS, ENABLE_CONTEXT_PRUNING
     RATE_LIMIT_REQUESTS = args.rpm
     UPSTREAM_TIMEOUT_SECONDS = args.timeout
-    MAX_CONCURRENT_REQUESTS = args.concurrency
+    MAX_CONCURRENT_REQUESTS = 1  # Rigid single track mode
     ENABLE_CONTEXT_PRUNING = args.context_pruning
 
     print(f"\n{'='*60}")
-    print(f"  NVIDIA API Completion-Based Rate Limiter")
+    print(f"  NVIDIA API Completion-Holdout Safety Proxy")
     print(f"{'='*60}")
-    print(f"  Running on:   http://{args.host}:{args.port}/")
-    print(f"  Concurrency:  {MAX_CONCURRENT_REQUESTS} parallel tracks")
-    print(f"  Max Goal:     {RATE_LIMIT_REQUESTS} completed requests/min")
+    print(f"  Running on:      http://{args.host}:{args.port}/")
+    print(f"  Pacing Engine:   1 Active Request at a time")
+    print(f"  Holdout Cushion: {COOLDOWN_BUFFER}s wait AFTER previous completion closes")
     print(f"{'='*60}\n")
     
     uvicorn.run(app, host=args.host, port=args.port)
