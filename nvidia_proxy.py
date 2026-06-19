@@ -12,6 +12,8 @@ import ssl
 from collections import deque
 import uuid
 import json
+import os
+import sys
 
 # TLS trust handling for environments running antivirus certificate interception
 try:
@@ -26,12 +28,12 @@ app = FastAPI()
 # Global configuration variables managed via command-line arguments
 RATE_LIMIT_REQUESTS = 40
 UPSTREAM_TIMEOUT_SECONDS = 500
-MAX_429_RETRIES = 5
+MAX_429_RETRIES = 0  # No retries — if we hit 429 despite pacing, fail immediately
 MAX_CONCURRENT_REQUESTS = 1
 MAX_CONTEXT_TOKENS = 160000
 KEEP_LAST_MESSAGES = 30
 ENABLE_CONTEXT_PRUNING = True
-MAX_RETRIES_NETWORK_ERRORS = 3
+MAX_RETRIES_NETWORK_ERRORS = 2
 
 INFLIGHT_REQUESTS = 0
 inflight_lock = asyncio.Lock()
@@ -41,6 +43,7 @@ pruning_lock = asyncio.Lock()
 # --- AIR-TIGHT PACING ENGINE STATE ---
 SEQUENTIAL_LOCK = asyncio.Lock()
 last_completion_time = 0.0  
+last_429_time = 0.0  # When we last got a 429
 COOLDOWN_BUFFER = 1.67  
 
 def get_concurrency_semaphore():
@@ -55,12 +58,21 @@ async def release_slot_and_decrement():
         INFLIGHT_REQUESTS = max(0, INFLIGHT_REQUESTS - 1)
     get_concurrency_semaphore().release()
 
-async def wait_for_holdout_and_record_completion():
+async def wait_for_holdout():
     """
-    Wait for holdout period BEFORE starting, then record completion AFTER request finishes.
-    Returns a callback that should be called when the request fully completes.
+    Wait for holdout period BEFORE starting. Does NOT set the completion
+    timestamp — that must be done by the caller when the request finishes.
+    Returns the time the holdout finished waiting.
     """
-    global last_completion_time
+    global last_completion_time, last_429_time
+    
+    # If we got a 429 recently, extend holdout to back off
+    now = time.monotonic()
+    since_429 = now - last_429_time
+    if since_429 < 10.0:
+        extra_wait = 10.0 - since_429
+        print(f"[pacing-engine] Rate-limited recently, extending holdout by {extra_wait:.2f}s")
+        await asyncio.sleep(extra_wait)
     
     now = time.monotonic()
     elapsed = now - last_completion_time
@@ -69,12 +81,6 @@ async def wait_for_holdout_and_record_completion():
         wait_needed = COOLDOWN_BUFFER - elapsed
         print(f"[pacing-engine] Strict holdout active. Waiting {wait_needed:.2f}s...")
         await asyncio.sleep(wait_needed)
-    
-    def record_completion():
-        global last_completion_time
-        last_completion_time = time.monotonic()
-    
-    return record_completion
 
 
 # --- SLIDING-WINDOW RPM ENFORCEMENT ---
@@ -316,7 +322,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_handler(request: Request, path: str):
-    global last_completion_time
+    global last_completion_time, last_429_time
     if request.method == "OPTIONS":
         return Response(status_code=204)
     stats["total_requests"] += 1
@@ -329,13 +335,8 @@ async def proxy_handler(request: Request, path: str):
     wait_start = time.time()
     
     async with SEQUENTIAL_LOCK:
-        # Wait for holdout period (blocks until previous request completed + cooldown)
-        record_completion = await wait_for_holdout_and_record_completion()
-        
-        # Enforce RPM sliding window
+        await wait_for_holdout()
         await enforce_rate_limit()
-        
-        # Secure concurrency slot
         await get_concurrency_semaphore().acquire()
         
         req_info.wait_time = round(time.time() - wait_start, 2)
@@ -349,19 +350,18 @@ async def proxy_handler(request: Request, path: str):
                 queue.remove(req_info)
         req_info.status = "forwarding"
 
-        # --- PROTECTED INBOUND CLIENT DISCONNECT GUARD BLOCK ---
         try:
             body = await request.body()
             body = await maybe_prune_chat_context(body, f"/{path}")
         except ClientDisconnect:
-            print(f"[proxy] Client disconnected early while waiting in pacing layout.")
+            print(f"[proxy] Client disconnected while queued.")
             req_info.request_complete_time = datetime.now().isoformat()
             req_info.response_time = round(time.time() - wait_start, 2)
             req_info.status = "Disconnected"
             stats["failed_requests"] += 1
             request_log.append(req_info)
             await release_slot_and_decrement()
-            record_completion()
+            last_completion_time = time.monotonic()
             return Response(status_code=244, content="Client disconnected from proxy channel early.")
 
         fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host",)}
@@ -377,59 +377,29 @@ async def proxy_handler(request: Request, path: str):
         
         try:
             async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
-                for attempt in range(MAX_429_RETRIES + 1):
-                    # Re-check holdout before each attempt
-                    now = time.monotonic()
-                    elapsed = now - last_completion_time
-                    if elapsed < COOLDOWN_BUFFER and attempt > 0:
-                        wait_needed = COOLDOWN_BUFFER - elapsed
-                        print(f"[pacing-engine] Re-holdout after 429: waiting {wait_needed:.2f}s...")
-                        await asyncio.sleep(wait_needed)
-                    
-                    upstream_req = client.build_request(method=request.method, url=target_url, headers=fwd_headers, content=body)
-                    try:
-                        req_info.request_sent_time = datetime.now().isoformat()
-                        upstream = await client.send(upstream_req, stream=True)
-                    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, ssl.SSLError) as exc:
-                        if attempt < MAX_RETRIES_NETWORK_ERRORS:
-                            stats["network_retries"] += 1
-                            retry_delay = min(2 ** attempt, 10)
-                            print(f"[proxy] Network error ({type(exc).__name__}), retrying in {retry_delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES_NETWORK_ERRORS})")
-                            await asyncio.sleep(retry_delay)
-                            continue
-                        raise
-                    
-                    if upstream.status_code == 429:
-                        retry_after_header = upstream.headers.get("retry-after")
-                        if retry_after_header:
-                            try:
-                                retry_after = int(retry_after_header)
-                            except ValueError:
-                                retry_after = min(2 ** attempt, 30)
-                        else:
-                            retry_after = min(2 ** attempt, 30)
-                        
-                        await upstream.aclose()
-                        
-                        if attempt < MAX_429_RETRIES:
-                            req_info.status = "rate-limited"
-                            stats["rate_limited_requests"] += 1
-                            print(f"[proxy] NVIDIA 429 encountered; holding {retry_after:.1f}s (attempt {attempt + 1}/{MAX_429_RETRIES})")
-                            await asyncio.sleep(retry_after)
-                            continue
-                        else:
-                            req_info.status = "rate-limited"
-                            stats["rate_limited_requests"] += 1
-                            print(f"[proxy] NVIDIA 429 after {MAX_429_RETRIES} retries, passing through")
-                            req_info.request_complete_time = datetime.now().isoformat()
-                            req_info.response_time = round(time.time() - wait_start, 2)
-                            request_log.append(req_info)
-                            await release_slot_and_decrement()
-                            record_completion()
-                            break
-                    else:
-                        record_rate_limit_usage_sync()
-                        break
+                upstream_req = client.build_request(method=request.method, url=target_url, headers=fwd_headers, content=body)
+                req_info.request_sent_time = datetime.now().isoformat()
+                upstream = await client.send(upstream_req, stream=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, ssl.SSLError) as exc:
+            req_info.request_complete_time = datetime.now().isoformat()
+            req_info.response_time = round(time.time() - wait_start, 2)
+            req_info.status = "failed"
+            stats["failed_requests"] += 1
+            request_log.append(req_info)
+            await release_slot_and_decrement()
+            last_completion_time = time.monotonic()
+            print(f"[proxy] Network error: {type(exc).__name__}: {exc}")
+            return Response(content=f"NVIDIA connection failed: {type(exc).__name__}", status_code=502)
+        except asyncio.TimeoutError:
+            req_info.request_complete_time = datetime.now().isoformat()
+            req_info.response_time = round(time.time() - wait_start, 2)
+            req_info.status = "failed"
+            stats["failed_requests"] += 1
+            request_log.append(req_info)
+            await release_slot_and_decrement()
+            last_completion_time = time.monotonic()
+            print(f"[proxy] Upstream timeout after {UPSTREAM_TIMEOUT_SECONDS}s")
+            return Response(content="NVIDIA upstream timeout", status_code=504)
         except Exception as exc:
             req_info.request_complete_time = datetime.now().isoformat()
             req_info.response_time = round(time.time() - wait_start, 2)
@@ -437,11 +407,28 @@ async def proxy_handler(request: Request, path: str):
             stats["failed_requests"] += 1
             request_log.append(req_info)
             await release_slot_and_decrement()
-            record_completion()
-            error_type = type(exc).__name__
-            error_detail = str(exc)
-            print(f"[proxy] Upstream request failed: {error_type}: {error_detail}")
-            return Response(content=f"Error connecting to NVIDIA backend: {error_type}: {error_detail}", status_code=502)
+            last_completion_time = time.monotonic()
+            print(f"[proxy] Upstream error: {type(exc).__name__}: {exc}")
+            return Response(content=f"NVIDIA upstream error: {type(exc).__name__}", status_code=502)
+
+        # --- 429: FAIL IMMEDIATELY, DON'T RETRY ---
+        if upstream.status_code == 429:
+            req_info.request_complete_time = datetime.now().isoformat()
+            req_info.response_time = round(time.time() - wait_start, 2)
+            req_info.status = "rate-limited"
+            stats["rate_limited_requests"] += 1
+            request_log.append(req_info)
+            last_429_time = time.monotonic()
+            err_body = b""
+            try:
+                err_body = await upstream.aread()
+            except Exception:
+                pass
+            await upstream.aclose()
+            await release_slot_and_decrement()
+            last_completion_time = time.monotonic()
+            print(f"[proxy] NVIDIA 429 - rate limited despite pacing. Aborting request.")
+            return Response(content=err_body, status_code=429)
 
         if upstream.status_code >= 400:
             req_info.request_complete_time = datetime.now().isoformat()
@@ -449,15 +436,17 @@ async def proxy_handler(request: Request, path: str):
             req_info.status = "failed"
             stats["failed_requests"] += 1
             request_log.append(req_info)
-            err_body = await upstream.aread()
+            try:
+                err_body = await upstream.aread()
+            except Exception:
+                err_body = b""
             await upstream.aclose()
             await release_slot_and_decrement()
-            record_completion()
+            last_completion_time = time.monotonic()
             return Response(content=err_body, status_code=upstream.status_code)
 
         resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"}
-
-        stream_complete_event = asyncio.Event()
+        record_rate_limit_usage_sync()
 
         async def relay():
             try:
@@ -475,21 +464,19 @@ async def proxy_handler(request: Request, path: str):
                 request_log.append(req_info)
                 await upstream.aclose()
                 await release_slot_and_decrement()
-                record_completion()
-                stream_complete_event.set()
+                global last_completion_time
+                last_completion_time = time.monotonic()
 
-        response = StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
-        await stream_complete_event.wait()
-        return response
+        return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
 
 def main():
     parser = argparse.ArgumentParser(description="NVIDIA API Token & Pacing Proxy")
-    parser.add_argument("--rpm", "-r", type=int, default=40, help="Max requests per minute (sliding window)")
+    parser.add_argument("--rpm", "-r", type=int, default=25, help="Max requests per minute (sliding window)")
     parser.add_argument("--port", "-p", type=int, default=8000)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--timeout", "-t", type=int, default=500)
     parser.add_argument("--cooldown", "-c", type=float, default=1.67, help="Post-completion holdout buffer in seconds")
-    parser.add_argument("--max-context-tokens", type=int, default=160000)
+    parser.add_argument("--max-context-tokens", type=int, default=170000)
     parser.add_argument("--keep-last-messages", type=int, default=30)
     parser.add_argument("--no-context-pruning", dest="context_pruning", action="store_false")
     parser.set_defaults(context_pruning=True)
@@ -513,9 +500,10 @@ def main():
     print(f"  Running on:         http://{args.host}:{args.port}/")
     print(f"  Rate Limit:         {RATE_LIMIT_REQUESTS} RPM (sliding window)")
     print(f"  Cooldown Buffer:    {COOLDOWN_BUFFER}s")
+    print(f"  Sequential Lock:    1 request at a time (held for full lifecycle)")
     print(f"  Pruning Logic:      Enabled (Ceiling: {MAX_CONTEXT_TOKENS} tokens)")
     print(f"  Message Window:     Always preserve last {KEEP_LAST_MESSAGES} loops")
-    print(f"  429 Retry-After:    Header parsing enabled")
+    print(f"  429 Handling:       Fail immediately - no retries (circuit breaker)")
     print(f"{'='*60}\n")
     
     uvicorn.run(app, host=args.host, port=args.port)
