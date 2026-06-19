@@ -62,7 +62,7 @@ async def wait_for_holdout():
     """
     Wait for holdout period BEFORE starting. Does NOT set the completion
     timestamp — that must be done by the caller when the request finishes.
-    Returns the time the holdout finished waiting.
+    Returns the actual holdout gap in seconds.
     """
     global last_completion_time, last_429_time
     
@@ -81,6 +81,9 @@ async def wait_for_holdout():
         wait_needed = COOLDOWN_BUFFER - elapsed
         print(f"[pacing-engine] Strict holdout active. Waiting {wait_needed:.2f}s...")
         await asyncio.sleep(wait_needed)
+        return wait_needed
+    
+    return 0.0
 
 
 # --- SLIDING-WINDOW RPM ENFORCEMENT ---
@@ -217,13 +220,19 @@ class RequestInfo:
         self.response_time = None
         self.request_sent_time = None
         self.request_complete_time = None
+        self.holdout_waited = 0.0
+        self.gap_from_previous = 0.0
+        self.holdout_compliant = False
     
     def to_dict(self):
         return {
             "id": self.id, "method": self.method, "path": self.path, "status": self.status,
             "wait_time": round(self.wait_time, 2), "timestamp": self.timestamp.isoformat(), 
             "response_time": self.response_time, "request_sent_time": self.request_sent_time,
-            "request_complete_time": self.request_complete_time
+            "request_complete_time": self.request_complete_time,
+            "holdout_waited": round(self.holdout_waited, 2),
+            "gap_from_previous": round(self.gap_from_previous, 2),
+            "holdout_compliant": self.holdout_compliant
         }
 
 def get_current_rpm():
@@ -237,60 +246,99 @@ async def dashboard(request: Request):
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>NVIDIA Proxy (Token Guard Active)</title>
+    <meta charset="UTF-8"><title>NVIDIA Proxy — Pacing Monitor</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #e0e0e0; padding: 20px; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        h1 { text-align: center; margin-bottom: 30px; color: #00ff88; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .stat-card { background: rgba(255, 255, 255, 0.05); border-radius: 12px; padding: 20px; border: 1px solid rgba(255, 255, 255, 0.1); }
-        .stat-card h3 { font-size: 0.9rem; color: #888; margin-bottom: 10px; }
-        .stat-card .value { font-size: 2rem; font-weight: bold; color: #00ff88; }
-        .rate-limit-info { background: rgba(0, 255, 136, 0.1); border: 1px solid #00ff88; border-radius: 12px; padding: 20px; margin-bottom: 30px; display: flex; justify-content: space-between; }
-        .limit { font-size: 1.5rem; font-weight: bold; color: #00ff88; }
-        .section { background: rgba(255, 255, 255, 0.05); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { text-align: left; padding: 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); }
-        .status-queued { color: #00aaff; } .status-forwarding { color: #00ff88; } .status-success { color: #00ff88; } .status-failed { color: #ff4444; } .status-disconnected { color: #ffaa00; }
+        body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 100%); color: #e0e0e0; padding: 20px; }
+        .container { max-width: 1600px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 30px; color: #00ff88; font-weight: 300; letter-spacing: 2px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .stat-card { background: rgba(255,255,255,0.04); border-radius: 12px; padding: 16px; border: 1px solid rgba(255,255,255,0.06); }
+        .stat-card h3 { font-size: 0.75rem; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+        .stat-card .value { font-size: 1.6rem; font-weight: 600; }
+        .rate-limit-info { background: rgba(0,255,136,0.06); border: 1px solid #00ff8844; border-radius: 12px; padding: 16px 24px; margin-bottom: 24px; display: flex; gap: 40px; flex-wrap: wrap; }
+        .rate-limit-info > div { min-width: 120px; }
+        .rate-limit-info h3 { font-size: 0.7rem; color: #888; text-transform: uppercase; letter-spacing: 1px; }
+        .rate-limit-info .limit { font-size: 1.3rem; font-weight: 600; color: #00ff88; }
+        .section { background: rgba(255,255,255,0.03); border-radius: 12px; padding: 20px; margin-bottom: 16px; border: 1px solid rgba(255,255,255,0.05); }
+        .section h2 { font-size: 0.95rem; color: #aaa; margin-bottom: 12px; font-weight: 400; letter-spacing: 1px; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+        th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.06); white-space: nowrap; }
+        th { color: #666; font-weight: 500; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.5px; }
+        .status-queued { color: #00aaff; } .status-forwarding { color: #00ff88; } .status-success { color: #00ff88; } .status-failed { color: #ff4444; } .status-rate-limited { color: #ff8800; } .status-disconnected { color: #ffaa00; }
+        .badge-ok { display: inline-block; background: #00ff8822; color: #00ff88; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; }
+        .badge-fail { display: inline-block; background: #ff444422; color: #ff4444; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; }
+        .mono { font-family: 'Consolas', monospace; font-size: 0.75rem; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>NVIDIA API Token & Pacing Monitor</h1>
+        <h1>NVIDIA API — Pacing Monitor</h1>
         <div class="rate-limit-info">
             <div><h3>Rate Limit</h3><div class="limit" id="rateLimitDisplay">40 RPM</div></div>
-            <div><h3>Active Connections</h3><div class="limit" id="concurrencyDisplay">0 / 1</div></div>
-            <div><h3>Current Window RPM</h3><div class="limit" id="currentRpmDisplay">0</div></div>
+            <div><h3>Cooldown</h3><div class="limit" id="cooldownDisplay">1.67s</div></div>
+            <div><h3>Active</h3><div class="limit" id="concurrencyDisplay">0 / 1</div></div>
+            <div><h3>Window RPM</h3><div class="limit" id="currentRpmDisplay">0</div></div>
         </div>
         <div class="stats-grid">
-             <div class="stat-card"><h3>Total Enters</h3><div class="value" id="totalRequests">0</div></div>
-             <div class="stat-card"><h3>Success</h3><div class="value" id="successfulRequests">0</div></div>
-             <div class="stat-card"><h3>Failed/Limited</h3><div class="value" style="color:#ff4444;" id="failedRequests">0</div></div>
-             <div class="stat-card"><h3>Prunings Executed</h3><div class="value" style="color:#00aaff;" id="contextPrunings">0</div></div>
+            <div class="stat-card"><h3>Total</h3><div class="value" id="totalRequests">0</div></div>
+            <div class="stat-card"><h3>Success</h3><div class="value" style="color:#00ff88;" id="successfulRequests">0</div></div>
+            <div class="stat-card"><h3>Failed</h3><div class="value" style="color:#ff4444;" id="failedRequests">0</div></div>
+            <div class="stat-card"><h3>Rate-Limited</h3><div class="value" style="color:#ff8800;" id="rateLimitedRequests">0</div></div>
+            <div class="stat-card"><h3>Prunings</h3><div class="value" style="color:#00aaff;" id="contextPrunings">0</div></div>
+            <div class="stat-card"><h3>Holdout OK</h3><div class="value" style="color:#00ff88;" id="holdoutCompliantCount">0</div></div>
         </div>
-        <div class="section"><h2>Queue Stream</h2><div id="queueContainer"><p style="color: #888;">Idle</p></div></div>
-        <div class="section"><h2>Recent Telemetry Calls</h2><table><thead><tr><th>ID</th><th>Method</th><th>Path</th><th>Status</th><th>Wait Time</th><th>Timestamp</th></tr></thead><tbody id="requestLogTable"></tbody></table></div>
+        <div class="section"><h2>Queue</h2><div id="queueContainer"><p style="color:#555; font-size:0.85rem;">Idle</p></div></div>
+        <div class="section">
+            <h2>Request Log</h2>
+            <div style="overflow-x:auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th><th>Method</th><th>Path</th><th>Status</th>
+                            <th>Sent</th><th>Completed</th><th>Duration</th>
+                            <th>Holdout Waited</th><th>Gap Prev→Sent</th><th>OK</th>
+                        </tr>
+                    </thead>
+                    <tbody id="requestLogTable"></tbody>
+                </table>
+            </div>
+        </div>
     </div>
     <script>
         let ws = null;
+        let holdoutOk = 0;
         function connectWebSocket() {
             ws = new WebSocket(`ws://${window.location.host}/ws`);
             ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                document.getElementById('rateLimitDisplay').textContent = `${data.rate_limit_rpm} RPM`;
-                document.getElementById('currentRpmDisplay').textContent = data.current_rpm;
-                document.getElementById('concurrencyDisplay').textContent = `${data.current_inflight} / ${data.max_concurrency}`;
-                document.getElementById('totalRequests').textContent = data.stats.total_requests;
-                document.getElementById('successfulRequests').textContent = data.stats.successful_requests;
-                document.getElementById('failedRequests').textContent = data.stats.failed_requests + data.stats.rate_limited_requests;
-                document.getElementById('contextPrunings').textContent = data.stats.context_prunings;
-                
+                const d = JSON.parse(event.data);
+                document.getElementById('rateLimitDisplay').textContent = d.rate_limit_rpm + ' RPM';
+                document.getElementById('cooldownDisplay').textContent = d.cooldown_buffer + 's';
+                document.getElementById('concurrencyDisplay').textContent = d.current_inflight + ' / ' + d.max_concurrency;
+                document.getElementById('currentRpmDisplay').textContent = d.current_rpm;
+                document.getElementById('totalRequests').textContent = d.stats.total_requests;
+                document.getElementById('successfulRequests').textContent = d.stats.successful_requests;
+                document.getElementById('failedRequests').textContent = d.stats.failed_requests;
+                document.getElementById('rateLimitedRequests').textContent = d.stats.rate_limited_requests;
+                document.getElementById('contextPrunings').textContent = d.stats.context_prunings;
+                holdoutOk = d.request_log.filter(r => r.holdout_compliant).length;
+                document.getElementById('holdoutCompliantCount').textContent = holdoutOk;
                 const q = document.getElementById('queueContainer');
-                q.innerHTML = data.queue.length > 0 ? data.queue.map(i => `<div>${i.method} ${i.path} <span class="status-queued">Queued</span></div>`).join('') : '<p style="color:#888;">Idle</p>';
-                
+                q.innerHTML = d.queue.length > 0
+                    ? d.queue.map(i => '<div style="padding:4px 0;font-size:0.85rem;">' + i.method + ' ' + i.path + ' <span class="status-queued">Queued</span> <span class="mono">(' + i.wait_time + 's)</span></div>').join('')
+                    : '<p style="color:#555;font-size:0.85rem;">Idle</p>';
                 const t = document.getElementById('requestLogTable');
-                t.innerHTML = data.request_log.slice(-15).reverse().map(r => `<tr><td>#${r.id}</td><td>${r.method}</td><td>${r.path}</td><td class="status-${r.status.toLowerCase()}">${r.status}</td><td>${r.wait_time}s</td><td>${new Date(r.timestamp).toLocaleTimeString()}</td></tr>`).join('');
+                t.innerHTML = d.request_log.slice(-30).reverse().map(r => {
+                    const st = new Date(r.timestamp).toLocaleTimeString();
+                    const sent = r.request_sent_time ? new Date(r.request_sent_time).toLocaleTimeString() : '-';
+                    const comp = r.request_complete_time ? new Date(r.request_complete_time).toLocaleTimeString() : '-';
+                    const dur = r.response_time ? r.response_time.toFixed(2) + 's' : '-';
+                    const hw = (r.holdout_waited || 0).toFixed(2) + 's';
+                    const gap = (r.gap_from_previous || 0).toFixed(2) + 's';
+                    const ok = r.holdout_compliant ? '<span class="badge-ok">OK</span>' : '<span class="badge-fail">FAIL</span>';
+                    return '<tr><td class="mono">#' + r.id + '</td><td>' + r.method + '</td><td>' + r.path + '</td><td class="status-' + r.status.toLowerCase() + '">' + r.status + '</td><td class="mono">' + sent +
+                        '</td><td class="mono">' + comp + '</td><td class="mono">' + dur + '</td><td class="mono">' + hw + '</td><td class="mono">' + gap + '</td><td>' + ok + '</td></tr>';
+                }).join('');
             };
             ws.onclose = () => { setTimeout(connectWebSocket, 2000); };
         }
@@ -308,7 +356,7 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = {
-                "rate_limit_rpm": RATE_LIMIT_REQUESTS, "current_rpm": get_current_rpm(),
+                "rate_limit_rpm": RATE_LIMIT_REQUESTS, "cooldown_buffer": round(COOLDOWN_BUFFER, 2), "current_rpm": get_current_rpm(),
                 "upstream_timeout": UPSTREAM_TIMEOUT_SECONDS, "max_concurrency": MAX_CONCURRENT_REQUESTS,
                 "current_inflight": INFLIGHT_REQUESTS, "stats": stats, "queue": [r.to_dict() for r in queue],
                 "request_log": [r.to_dict() for r in request_log][-50:]
@@ -335,7 +383,13 @@ async def proxy_handler(request: Request, path: str):
     wait_start = time.time()
     
     async with SEQUENTIAL_LOCK:
-        await wait_for_holdout()
+        now_before_holdout = time.monotonic()
+        gap_from_previous = now_before_holdout - last_completion_time
+        holdout_waited = await wait_for_holdout()
+        req_info.holdout_waited = holdout_waited
+        req_info.gap_from_previous = gap_from_previous
+        req_info.holdout_compliant = gap_from_previous >= COOLDOWN_BUFFER
+        
         await enforce_rate_limit()
         await get_concurrency_semaphore().acquire()
         
