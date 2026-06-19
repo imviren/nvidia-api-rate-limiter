@@ -99,6 +99,10 @@ async def record_rate_limit_usage():
     async with rate_limit_lock:
         rate_limit_window.append(time.monotonic())
 
+def record_rate_limit_usage_sync():
+    """Synchronous version for use in finally blocks."""
+    rate_limit_window.append(time.monotonic())
+
 
 # --- SPEC-SAFE CONTEXT PRUNING LOGIC ---
 def estimate_tokens(text) -> int:
@@ -175,6 +179,18 @@ async def maybe_prune_chat_context(body: bytes, path: str) -> bytes:
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com"
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade"}
 
+shared_client = None
+
+async def get_shared_client():
+    global shared_client
+    if shared_client is None:
+        shared_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, read=UPSTREAM_TIMEOUT_SECONDS),
+            verify=SSL_CONTEXT,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)
+        )
+    return shared_client
+
 request_log = deque(maxlen=100)
 queue = deque()
 queue_lock = asyncio.Lock()
@@ -193,11 +209,15 @@ class RequestInfo:
         self.wait_time = wait_time
         self.timestamp = datetime.now()
         self.response_time = None
+        self.request_sent_time = None
+        self.request_complete_time = None
     
     def to_dict(self):
         return {
             "id": self.id, "method": self.method, "path": self.path, "status": self.status,
-            "wait_time": round(self.wait_time, 2), "timestamp": self.timestamp.isoformat(), "response_time": self.response_time
+            "wait_time": round(self.wait_time, 2), "timestamp": self.timestamp.isoformat(), 
+            "response_time": self.response_time, "request_sent_time": self.request_sent_time,
+            "request_complete_time": self.request_complete_time
         }
 
 def get_current_rpm():
@@ -297,6 +317,8 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_handler(request: Request, path: str):
     global last_completion_time
+    if request.method == "OPTIONS":
+        return Response(status_code=204)
     stats["total_requests"] += 1
     req_info = RequestInfo(request.method, f"/{path}")
 
@@ -333,11 +355,12 @@ async def proxy_handler(request: Request, path: str):
             body = await maybe_prune_chat_context(body, f"/{path}")
         except ClientDisconnect:
             print(f"[proxy] Client disconnected early while waiting in pacing layout.")
-            await release_slot_and_decrement()
-            req_info.status = "Disconnected"
+            req_info.request_complete_time = datetime.now().isoformat()
             req_info.response_time = round(time.time() - wait_start, 2)
+            req_info.status = "Disconnected"
             stats["failed_requests"] += 1
             request_log.append(req_info)
+            await release_slot_and_decrement()
             record_completion()
             return Response(status_code=244, content="Client disconnected from proxy channel early.")
 
@@ -350,13 +373,22 @@ async def proxy_handler(request: Request, path: str):
         if request.url.query:
             target_url += f"?{request.url.query}"
 
-        client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=UPSTREAM_TIMEOUT_SECONDS), verify=SSL_CONTEXT)
+        client = await get_shared_client()
         
         try:
             async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
                 for attempt in range(MAX_429_RETRIES + 1):
+                    # Re-check holdout before each attempt
+                    now = time.monotonic()
+                    elapsed = now - last_completion_time
+                    if elapsed < COOLDOWN_BUFFER and attempt > 0:
+                        wait_needed = COOLDOWN_BUFFER - elapsed
+                        print(f"[pacing-engine] Re-holdout after 429: waiting {wait_needed:.2f}s...")
+                        await asyncio.sleep(wait_needed)
+                    
                     upstream_req = client.build_request(method=request.method, url=target_url, headers=fwd_headers, content=body)
                     try:
+                        req_info.request_sent_time = datetime.now().isoformat()
                         upstream = await client.send(upstream_req, stream=True)
                     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, ssl.SSLError) as exc:
                         if attempt < MAX_RETRIES_NETWORK_ERRORS:
@@ -389,19 +421,22 @@ async def proxy_handler(request: Request, path: str):
                             req_info.status = "rate-limited"
                             stats["rate_limited_requests"] += 1
                             print(f"[proxy] NVIDIA 429 after {MAX_429_RETRIES} retries, passing through")
-                            record_rate_limit_usage()
+                            req_info.request_complete_time = datetime.now().isoformat()
+                            req_info.response_time = round(time.time() - wait_start, 2)
+                            request_log.append(req_info)
+                            await release_slot_and_decrement()
                             record_completion()
                             break
                     else:
-                        record_rate_limit_usage()
+                        record_rate_limit_usage_sync()
                         break
         except Exception as exc:
-            await release_slot_and_decrement()
-            await client.aclose()
-            req_info.status = "failed"
+            req_info.request_complete_time = datetime.now().isoformat()
             req_info.response_time = round(time.time() - wait_start, 2)
+            req_info.status = "failed"
             stats["failed_requests"] += 1
             request_log.append(req_info)
+            await release_slot_and_decrement()
             record_completion()
             error_type = type(exc).__name__
             error_detail = str(exc)
@@ -409,14 +444,14 @@ async def proxy_handler(request: Request, path: str):
             return Response(content=f"Error connecting to NVIDIA backend: {error_type}: {error_detail}", status_code=502)
 
         if upstream.status_code >= 400:
-            await release_slot_and_decrement()
-            err_body = await upstream.aread()
-            await upstream.aclose()
-            await client.aclose()
-            req_info.status = "failed"
+            req_info.request_complete_time = datetime.now().isoformat()
             req_info.response_time = round(time.time() - wait_start, 2)
+            req_info.status = "failed"
             stats["failed_requests"] += 1
             request_log.append(req_info)
+            err_body = await upstream.aread()
+            await upstream.aclose()
+            await release_slot_and_decrement()
             record_completion()
             return Response(content=err_body, status_code=upstream.status_code)
 
@@ -433,10 +468,10 @@ async def proxy_handler(request: Request, path: str):
                 req_info.status = "failed"
                 stats["failed_requests"] += 1
             finally:
+                req_info.request_complete_time = datetime.now().isoformat()
                 req_info.response_time = round(time.time() - wait_start, 2)
                 request_log.append(req_info)
                 await upstream.aclose()
-                await client.aclose()
                 await release_slot_and_decrement()
                 record_completion()
 
