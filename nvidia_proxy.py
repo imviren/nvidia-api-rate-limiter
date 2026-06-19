@@ -27,14 +27,16 @@ app = FastAPI()
 RATE_LIMIT_REQUESTS = 40
 UPSTREAM_TIMEOUT_SECONDS = 500
 MAX_429_RETRIES = 5
-MAX_CONCURRENT_REQUESTS = 1  
+MAX_CONCURRENT_REQUESTS = 1
 MAX_CONTEXT_TOKENS = 160000
 KEEP_LAST_MESSAGES = 30
 ENABLE_CONTEXT_PRUNING = True
+MAX_RETRIES_NETWORK_ERRORS = 3
 
 INFLIGHT_REQUESTS = 0
 inflight_lock = asyncio.Lock()
 concurrency_semaphore = None
+pruning_lock = asyncio.Lock()
 
 # --- AIR-TIGHT PACING ENGINE STATE ---
 SEQUENTIAL_LOCK = asyncio.Lock()
@@ -79,11 +81,15 @@ async def enforce_rate_limit():
             while rate_limit_window and now - rate_limit_window[0] > 60:
                 rate_limit_window.popleft()
             if len(rate_limit_window) < RATE_LIMIT_REQUESTS:
-                rate_limit_window.append(now)
                 return
             wait = rate_limit_window[0] + 60 - now
         print(f"[rate-limit] Window full ({len(rate_limit_window)}/{RATE_LIMIT_REQUESTS} RPM). Waiting {wait:.2f}s...")
         await asyncio.sleep(min(wait, 1.0))
+
+async def record_rate_limit_usage():
+    """Records a request in the sliding window after successful forwarding."""
+    async with rate_limit_lock:
+        rate_limit_window.append(time.monotonic())
 
 
 # --- SPEC-SAFE CONTEXT PRUNING LOGIC ---
@@ -166,7 +172,7 @@ queue = deque()
 queue_lock = asyncio.Lock()
 
 stats = {
-    "total_requests": 0, "successful_requests": 0, "rate_limited_requests": 0, "failed_requests": 0, "context_prunings": 0,
+    "total_requests": 0, "successful_requests": 0, "rate_limited_requests": 0, "failed_requests": 0, "context_prunings": 0, "network_retries": 0,
     "start_time": datetime.now().isoformat(),
 }
 
@@ -333,8 +339,10 @@ async def proxy_handler(request: Request, path: str):
         request_log.append(req_info)
         return Response(status_code=244, content="Client disconnected from proxy channel early.")
 
-    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host", "content-length")}
+    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host",)}
     fwd_headers["host"] = "integrate.api.nvidia.com"
+    if body:
+        fwd_headers["content-length"] = str(len(body))
 
     target_url = f"{NVIDIA_BASE_URL}/{path}"
     if request.url.query:
@@ -346,16 +354,47 @@ async def proxy_handler(request: Request, path: str):
     try:
         async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
             for attempt in range(MAX_429_RETRIES + 1):
+                await enforce_rate_limit()
+                
                 upstream_req = client.build_request(method=request.method, url=target_url, headers=fwd_headers, content=body)
-                upstream = await client.send(upstream_req, stream=True)
-                if upstream.status_code != 429 or attempt == MAX_429_RETRIES:
+                try:
+                    upstream = await client.send(upstream_req, stream=True)
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, ssl.SSLError) as exc:
+                    if attempt < MAX_RETRIES_NETWORK_ERRORS:
+                        stats["network_retries"] += 1
+                        retry_delay = min(2 ** attempt, 10)
+                        print(f"[proxy] Network error ({type(exc).__name__}), retrying in {retry_delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES_NETWORK_ERRORS})")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    raise
+                
+                if upstream.status_code == 429:
+                    retry_after_header = upstream.headers.get("retry-after")
+                    if retry_after_header:
+                        try:
+                            retry_after = int(retry_after_header)
+                        except ValueError:
+                            retry_after = min(2 ** attempt, 30)
+                    else:
+                        retry_after = min(2 ** attempt, 30)
+                    
+                    await upstream.aclose()
+                    
+                    if attempt < MAX_429_RETRIES:
+                        req_info.status = "rate-limited"
+                        stats["rate_limited_requests"] += 1
+                        print(f"[proxy] NVIDIA 429 encountered; holding {retry_after:.1f}s (attempt {attempt + 1}/{MAX_429_RETRIES})")
+                        await asyncio.sleep(retry_after)
+                        continue
+                    else:
+                        req_info.status = "rate-limited"
+                        stats["rate_limited_requests"] += 1
+                        print(f"[proxy] NVIDIA 429 after {MAX_429_RETRIES} retries, passing through")
+                        record_rate_limit_usage()
+                        break
+                else:
+                    record_rate_limit_usage()
                     break
-                retry_after = min(2 ** attempt, 30)
-                await upstream.aclose()
-                req_info.status = "rate-limited"
-                stats["rate_limited_requests"] += 1
-                print(f"[proxy] NVIDIA 429 encountered; holding {retry_after:.1f}s")
-                await asyncio.sleep(retry_after)
     except Exception as exc:
         await release_slot_and_decrement()
         await client.aclose()
@@ -364,7 +403,10 @@ async def proxy_handler(request: Request, path: str):
         stats["failed_requests"] += 1
         request_log.append(req_info)
         last_completion_time = time.monotonic()
-        return Response(content=f"Error connecting to NVIDIA backend: {exc}", status_code=502)
+        error_type = type(exc).__name__
+        error_detail = str(exc)
+        print(f"[proxy] Upstream request failed: {error_type}: {error_detail}")
+        return Response(content=f"Error connecting to NVIDIA backend: {error_type}: {error_detail}", status_code=502)
 
     if upstream.status_code >= 400:
         await release_slot_and_decrement()
@@ -434,6 +476,7 @@ def main():
     print(f"  Cooldown Buffer:    {COOLDOWN_BUFFER}s")
     print(f"  Pruning Logic:      Enabled (Ceiling: {MAX_CONTEXT_TOKENS} tokens)")
     print(f"  Message Window:     Always preserve last {KEEP_LAST_MESSAGES} loops")
+    print(f"  429 Retry-After:    Header parsing enabled")
     print(f"{'='*60}\n")
     
     uvicorn.run(app, host=args.host, port=args.port)

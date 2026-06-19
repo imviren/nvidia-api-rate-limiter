@@ -239,6 +239,15 @@ python nvidia_proxy.py --rpm 30 --port 8000 --host 127.0.0.1 --cooldown 2.0
 
 ## Changelog
 
+### v1.3 — Smart 429 Handling + Network Retry Logic
+
+- **Fixed**: Rate limit window now records requests **after** successful send (not before). Previously, 429 retries consumed window slots, causing artificial rate limiting.
+- **New**: **Retry-After header parsing** — respects NVIDIA's specified wait time instead of using only exponential backoff.
+- **New**: **Network error retries** — automatically retries `ConnectError`, `ConnectTimeout`, `NetworkError`, and `SSLError` up to 3 times with exponential backoff (max 10s).
+- **Improved**: 429 retry logic now separates rate-limited vs. network failures, with better logging showing attempt counts.
+- **Improved**: Error messages now include exception type and details for easier debugging.
+- **Fixed**: `content-length` header now forwarded to upstream (improves compatibility with some endpoints).
+
 ### v1.2 — Real RPM Sliding-Window Enforcement
 
 - **New**: `--rpm` flag now enforces a real 60s sliding window instead of being cosmetic. Requests are delayed when the window is full.
