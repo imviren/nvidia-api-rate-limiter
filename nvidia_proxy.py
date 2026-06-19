@@ -43,8 +43,9 @@ pruning_lock = asyncio.Lock()
 # --- AIR-TIGHT PACING ENGINE STATE ---
 SEQUENTIAL_LOCK = asyncio.Lock()
 last_completion_time = 0.0  
-last_429_time = 0.0  # When we last got a 429
+last_429_time = 0.0
 COOLDOWN_BUFFER = 1.67  
+CIRCUIT_BREAKER_OPEN = False
 
 def get_concurrency_semaphore():
     global concurrency_semaphore
@@ -64,15 +65,7 @@ async def wait_for_holdout():
     timestamp — that must be done by the caller when the request finishes.
     Returns the actual holdout gap in seconds.
     """
-    global last_completion_time, last_429_time
-    
-    # If we got a 429 recently, extend holdout to back off
-    now = time.monotonic()
-    since_429 = now - last_429_time
-    if since_429 < 10.0:
-        extra_wait = 10.0 - since_429
-        print(f"[pacing-engine] Rate-limited recently, extending holdout by {extra_wait:.2f}s")
-        await asyncio.sleep(extra_wait)
+    global last_completion_time
     
     now = time.monotonic()
     elapsed = now - last_completion_time
@@ -279,6 +272,7 @@ async def dashboard(request: Request):
             <div><h3>Cooldown</h3><div class="limit" id="cooldownDisplay">1.67s</div></div>
             <div><h3>Active</h3><div class="limit" id="concurrencyDisplay">0 / 1</div></div>
             <div><h3>Window RPM</h3><div class="limit" id="currentRpmDisplay">0</div></div>
+            <div><h3>Circuit</h3><div class="limit" id="circuitDisplay" style="color:#00ff88;">CLOSED</div></div>
         </div>
         <div class="stats-grid">
             <div class="stat-card"><h3>Total</h3><div class="value" id="totalRequests">0</div></div>
@@ -316,6 +310,8 @@ async def dashboard(request: Request):
                 document.getElementById('cooldownDisplay').textContent = d.cooldown_buffer + 's';
                 document.getElementById('concurrencyDisplay').textContent = d.current_inflight + ' / ' + d.max_concurrency;
                 document.getElementById('currentRpmDisplay').textContent = d.current_rpm;
+                document.getElementById('circuitDisplay').textContent = d.circuit_breaker_open ? 'OPEN' : 'CLOSED';
+                document.getElementById('circuitDisplay').style.color = d.circuit_breaker_open ? '#ff4444' : '#00ff88';
                 document.getElementById('totalRequests').textContent = d.stats.total_requests;
                 document.getElementById('successfulRequests').textContent = d.stats.successful_requests;
                 document.getElementById('failedRequests').textContent = d.stats.failed_requests;
@@ -359,7 +355,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 "rate_limit_rpm": RATE_LIMIT_REQUESTS, "cooldown_buffer": round(COOLDOWN_BUFFER, 2), "current_rpm": get_current_rpm(),
                 "upstream_timeout": UPSTREAM_TIMEOUT_SECONDS, "max_concurrency": MAX_CONCURRENT_REQUESTS,
                 "current_inflight": INFLIGHT_REQUESTS, "stats": stats, "queue": [r.to_dict() for r in queue],
-                "request_log": [r.to_dict() for r in request_log][-50:]
+                "request_log": [r.to_dict() for r in request_log][-50:],
+                "circuit_breaker_open": CIRCUIT_BREAKER_OPEN
             }
             await websocket.send_json(data)
             await asyncio.sleep(1)
@@ -370,9 +367,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_handler(request: Request, path: str):
-    global last_completion_time, last_429_time
+    global last_completion_time, CIRCUIT_BREAKER_OPEN
     if request.method == "OPTIONS":
         return Response(status_code=204)
+
+    if CIRCUIT_BREAKER_OPEN:
+        print(f"[circuit-breaker] REJECTED {request.method} /{path} — proxy locked due to previous 429")
+        return Response(content='{"error":"Proxy circuit breaker open — NVIDIA rate-limited previously. Restart proxy to retry."}', status_code=429, media_type="application/json")
+    
     stats["total_requests"] += 1
     req_info = RequestInfo(request.method, f"/{path}")
 
@@ -465,14 +467,14 @@ async def proxy_handler(request: Request, path: str):
             print(f"[proxy] Upstream error: {type(exc).__name__}: {exc}")
             return Response(content=f"NVIDIA upstream error: {type(exc).__name__}", status_code=502)
 
-        # --- 429: FAIL IMMEDIATELY, DON'T RETRY ---
+        # --- 429: FAIL IMMEDIATELY, BLOCK ALL FUTURE REQUESTS ---
         if upstream.status_code == 429:
+            CIRCUIT_BREAKER_OPEN = True
             req_info.request_complete_time = datetime.now().isoformat()
             req_info.response_time = round(time.time() - wait_start, 2)
             req_info.status = "rate-limited"
             stats["rate_limited_requests"] += 1
             request_log.append(req_info)
-            last_429_time = time.monotonic()
             err_body = b""
             try:
                 err_body = await upstream.aread()
@@ -481,7 +483,7 @@ async def proxy_handler(request: Request, path: str):
             await upstream.aclose()
             await release_slot_and_decrement()
             last_completion_time = time.monotonic()
-            print(f"[proxy] NVIDIA 429 - rate limited despite pacing. Aborting request.")
+            print(f"[circuit-breaker] NVIDIA 429 — locking proxy. All future requests will be rejected until restart.")
             return Response(content=err_body, status_code=429)
 
         if upstream.status_code >= 400:
@@ -557,7 +559,7 @@ def main():
     print(f"  Sequential Lock:    1 request at a time (held for full lifecycle)")
     print(f"  Pruning Logic:      Enabled (Ceiling: {MAX_CONTEXT_TOKENS} tokens)")
     print(f"  Message Window:     Always preserve last {KEEP_LAST_MESSAGES} loops")
-    print(f"  429 Handling:       Fail immediately - no retries (circuit breaker)")
+    print(f"  429 Handling:       Hard circuit breaker — locks proxy on first 429")
     print(f"{'='*60}\n")
     
     uvicorn.run(app, host=args.host, port=args.port)
