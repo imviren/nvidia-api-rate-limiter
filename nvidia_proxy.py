@@ -24,7 +24,7 @@ except Exception:
 app = FastAPI()
 
 # Global configuration variables managed via command-line arguments
-RATE_LIMIT_REQUESTS = 30
+RATE_LIMIT_REQUESTS = 40
 UPSTREAM_TIMEOUT_SECONDS = 500
 MAX_429_RETRIES = 5
 MAX_CONCURRENT_REQUESTS = 1  
@@ -65,6 +65,25 @@ async def enforce_completion_holdout():
         await asyncio.sleep(wait_needed)
     
     last_completion_time = time.monotonic()
+
+
+# --- SLIDING-WINDOW RPM ENFORCEMENT ---
+rate_limit_window = deque()  # monotonic timestamps of forwarded request starts
+rate_limit_lock = asyncio.Lock()
+
+async def enforce_rate_limit():
+    """Ensures we never exceed RATE_LIMIT_REQUESTS forwarded starts in any rolling 60s window."""
+    while True:
+        async with rate_limit_lock:
+            now = time.monotonic()
+            while rate_limit_window and now - rate_limit_window[0] > 60:
+                rate_limit_window.popleft()
+            if len(rate_limit_window) < RATE_LIMIT_REQUESTS:
+                rate_limit_window.append(now)
+                return
+            wait = rate_limit_window[0] + 60 - now
+        print(f"[rate-limit] Window full ({len(rate_limit_window)}/{RATE_LIMIT_REQUESTS} RPM). Waiting {wait:.2f}s...")
+        await asyncio.sleep(min(wait, 1.0))
 
 
 # --- SPEC-SAFE CONTEXT PRUNING LOGIC ---
@@ -200,7 +219,7 @@ async def dashboard(request: Request):
     <div class="container">
         <h1>NVIDIA API Token & Pacing Monitor</h1>
         <div class="rate-limit-info">
-            <div><h3>Pacing Layout</h3><div class="limit">Sequential Predictive Window</div></div>
+            <div><h3>Rate Limit</h3><div class="limit" id="rateLimitDisplay">40 RPM</div></div>
             <div><h3>Active Connections</h3><div class="limit" id="concurrencyDisplay">0 / 1</div></div>
             <div><h3>Current Window RPM</h3><div class="limit" id="currentRpmDisplay">0</div></div>
         </div>
@@ -219,6 +238,7 @@ async def dashboard(request: Request):
             ws = new WebSocket(`ws://${window.location.host}/ws`);
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
+                document.getElementById('rateLimitDisplay').textContent = `${data.rate_limit_rpm} RPM`;
                 document.getElementById('currentRpmDisplay').textContent = data.current_rpm;
                 document.getElementById('concurrencyDisplay').textContent = `${data.current_inflight} / ${data.max_concurrency}`;
                 document.getElementById('totalRequests').textContent = data.stats.total_requests;
@@ -279,7 +299,10 @@ async def proxy_handler(request: Request, path: str):
         # 2. Process our holdout parameters
         await enforce_completion_holdout()
         
-        # 3. Secure slot allocation marker
+        # 3. Enforce RPM sliding window (real rate limit)
+        await enforce_rate_limit()
+        
+        # 4. Secure slot allocation marker
         await get_concurrency_semaphore().acquire()
         
         req_info.wait_time = round(time.time() - wait_start, 2)
@@ -380,10 +403,11 @@ async def proxy_handler(request: Request, path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="NVIDIA API Token & Pacing Proxy")
-    parser.add_argument("--rpm", "-r", type=int, default=30)
+    parser.add_argument("--rpm", "-r", type=int, default=40, help="Max requests per minute (sliding window)")
     parser.add_argument("--port", "-p", type=int, default=8000)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--timeout", "-t", type=int, default=500)
+    parser.add_argument("--cooldown", "-c", type=float, default=1.67, help="Post-completion holdout buffer in seconds")
     parser.add_argument("--max-context-tokens", type=int, default=160000)
     parser.add_argument("--keep-last-messages", type=int, default=30)
     parser.add_argument("--no-context-pruning", dest="context_pruning", action="store_false")
@@ -392,10 +416,11 @@ def main():
     args = parser.parse_args()
 
     global RATE_LIMIT_REQUESTS, UPSTREAM_TIMEOUT_SECONDS, MAX_CONCURRENT_REQUESTS, ENABLE_CONTEXT_PRUNING
-    global MAX_CONTEXT_TOKENS, KEEP_LAST_MESSAGES
+    global MAX_CONTEXT_TOKENS, KEEP_LAST_MESSAGES, COOLDOWN_BUFFER
     
     RATE_LIMIT_REQUESTS = args.rpm
     UPSTREAM_TIMEOUT_SECONDS = args.timeout
+    COOLDOWN_BUFFER = args.cooldown
     MAX_CONCURRENT_REQUESTS = 1  
     ENABLE_CONTEXT_PRUNING = args.context_pruning
     MAX_CONTEXT_TOKENS = args.max_context_tokens
@@ -405,7 +430,8 @@ def main():
     print(f"  NVIDIA API Intelligent Token & Pacing Proxy")
     print(f"{'='*60}")
     print(f"  Running on:         http://{args.host}:{args.port}/")
-    print(f"  Pacing Setup:       1 Upstream Connection Stream Max")
+    print(f"  Rate Limit:         {RATE_LIMIT_REQUESTS} RPM (sliding window)")
+    print(f"  Cooldown Buffer:    {COOLDOWN_BUFFER}s")
     print(f"  Pruning Logic:      Enabled (Ceiling: {MAX_CONTEXT_TOKENS} tokens)")
     print(f"  Message Window:     Always preserve last {KEEP_LAST_MESSAGES} loops")
     print(f"{'='*60}\n")

@@ -1,10 +1,11 @@
 # NVIDIA API Rate Limiting Proxy
 
-A lightweight reverse proxy that intercepts NVIDIA API calls and applies **sequential holdout pacing** to stay within NVIDIA rate limits. Includes a real-time WebSocket dashboard.
+A lightweight reverse proxy that intercepts NVIDIA API calls and applies **sliding-window RPM enforcement + sequential holdout pacing** to stay within NVIDIA rate limits. Includes a real-time WebSocket dashboard.
 
 ## Features
 
-- **Completion-Based Holdout**: Sequential pacing engine that enforces a configurable cooldown gap (default 1.67s) between request completions, preventing 429 responses
+- **Sliding-Window RPM Enforcement**: Enforces a true 60s rolling window (default 40 RPM to match NVIDIA free tier). The `--rpm` flag actually controls the limit — not just cosmetic
+- **Completion-Based Holdout**: Secondary pacing engine that enforces a configurable cooldown gap (default 1.67s) between request completions, smoothing burst edges
 - **Single-Stream Concurrency**: One request at a time through the upstream to guarantee pacing integrity
 - **429 Retry Logic**: Exponential backoff (up to 5 retries, capped at 30s) on NVIDIA rate-limit responses
 - **Context Pruning (Opt-in)**: Optionally prune chat history to stay under token limits — opt-in via `--no-context-pruning` (default: on with 160K ceiling)
@@ -26,22 +27,22 @@ pip install fastapi uvicorn httpx truststore certifi python-multipart websockets
 
 ## Usage
 
-### Basic Usage (Default: ~36 RPM, sequential)
+### Basic Usage (Default: 40 RPM, 1.67s cooldown)
 
 ```bash
 python nvidia_proxy.py
 ```
 
-### Custom Port / Timeout
+### Custom Rate Limit (match NVIDIA free tier)
 
 ```bash
-python nvidia_proxy.py --port 8000 --host 127.0.0.1 --timeout 500
+python nvidia_proxy.py --rpm 40
 ```
 
 ### Full Options
 
 ```bash
-python nvidia_proxy.py --rpm 30 --port 8000 --host 127.0.0.1 --timeout 500 --cooldown 1.67
+python nvidia_proxy.py --rpm 40 --port 8000 --host 127.0.0.1 --timeout 500 --cooldown 1.0
 ```
 
 ## Context Pruning
@@ -59,13 +60,13 @@ python nvidia_proxy.py --no-context-pruning
 
 | Argument | Short | Default | Description |
 |----------|-------|---------|-------------|
-| `--rpm` | `-r` | 30 | Target RPM (informational, pacing driven by cooldown) |
+| `--rpm` | `-r` | 40 | Max requests per rolling 60s window |
 | `--port` | `-p` | 8000 | Port to run the proxy on |
 | `--host` | | 127.0.0.1 | Host to bind to |
 | `--timeout` | `-t` | 500 | Upstream timeout in seconds |
+| `--cooldown` | `-c` | 1.67 | Post-completion holdout buffer (seconds) |
 | `--max-context-tokens` | | 160000 | Token ceiling for context pruning |
 | `--keep-last-messages` | | 30 | Messages to preserve when pruning |
-| `--cooldown` | `-c` | 1.67 | Post-completion holdout buffer (seconds) |
 | `--no-context-pruning` | | | Disable context pruning |
 
 ## Configuration
@@ -109,30 +110,32 @@ The dashboard displays:
 
 1. **Intercept**: OpenCode sends requests to the local proxy instead of directly to NVIDIA
 2. **Queue**: Requests enter a FIFO queue behind the sequential lock
-3. **Pace**: A global `asyncio.Lock` ensures only one request passes through the pacing gate at a time. `enforce_completion_holdout()` checks the elapsed time since the last response stream closed — if less than `COOLDOWN_BUFFER` (default 1.67s), it sleeps the difference
-4. **Forward**: Approved requests stream to the NVIDIA API with 429 retry logic (exponential backoff, up to 5 retries, 30s cap)
-5. **Track Completion**: When the upstream response stream fully closes, the completion timestamp is recorded, enabling the next request's holdout calculation
-6. **Dashboard**: All stats are pushed to the browser dashboard via WebSocket every second
+3. **RPM Gate**: `enforce_rate_limit()` checks a sliding window of forwarded request starts — if `RATE_LIMIT_REQUESTS` starts exist in the last 60s, it delays until a slot opens
+4. **Holdout Gate**: `enforce_completion_holdout()` checks the elapsed time since the last response stream closed — if less than `COOLDOWN_BUFFER` (default 1.67s), it sleeps the difference. This smooths burst edges
+5. **Forward**: Approved requests stream to the NVIDIA API with 429 retry logic (exponential backoff, up to 5 retries, 30s cap)
+6. **Track Completion**: When the upstream response stream fully closes, the completion timestamp is recorded, enabling the next request's holdout calculation
+7. **Dashboard**: All stats are pushed to the browser dashboard via WebSocket every second
 
 ### Architecture
 
 ```
-OpenCode → Queue → Sequential Lock → Holdout Gate → NVIDIA API
-                ↕                                    ↓ (on stream close)
-           Dashboard ←── WebSocket ←── Stats + Completion Log
+OpenCode → Queue → Sequential Lock → RPM Window → Holdout Gate → NVIDIA API
+                                          ↓
+                               deque of start timestamps
+                                    (60s rolling)
 ```
 
 ## Recommended Settings
 
 ```bash
-# Default (36 RPM throughput, sequential)
+# Default (40 RPM, matches NVIDIA free tier)
 python nvidia_proxy.py
 
-# Tighter cooldown for faster responses (higher 429 risk)
-python nvidia_proxy.py --cooldown 1.0
+# Conservative (lower RPM for safety margin)
+python nvidia_proxy.py --rpm 30 --cooldown 2.0
 
-# Conservative (lower RPM, max safety)
-python nvidia_proxy.py --cooldown 3.0
+# Tighter cooldown + max RPM (higher 429 risk)
+python nvidia_proxy.py --rpm 40 --cooldown 1.0
 ```
 
 ## Quick Setup (Windows)
@@ -235,6 +238,12 @@ python nvidia_proxy.py --rpm 30 --port 8000 --host 127.0.0.1 --cooldown 2.0
 ---
 
 ## Changelog
+
+### v1.2 — Real RPM Sliding-Window Enforcement
+
+- **New**: `--rpm` flag now enforces a real 60s sliding window instead of being cosmetic. Requests are delayed when the window is full.
+- **New**: `--cooldown` flag made configurable via CLI (was hardcoded).
+- **Changed**: Default RPM from 30 → 40 to match NVIDIA free tier limit.
 
 ### v1.1 — Pacing Engine Fixes
 
