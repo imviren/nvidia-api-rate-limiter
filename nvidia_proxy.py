@@ -423,7 +423,6 @@ async def proxy_handler(request: Request, path: str):
     resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"}
 
     async def relay():
-        global last_completion_time
         try:
             async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
                 async for chunk in upstream.aiter_raw():
@@ -439,9 +438,14 @@ async def proxy_handler(request: Request, path: str):
             await upstream.aclose()
             await client.aclose()
             await release_slot_and_decrement()
-            last_completion_time = time.monotonic()
 
-    return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
+    async def completion_callback():
+        global last_completion_time
+        async for _ in relay():
+            yield _
+        last_completion_time = time.monotonic()
+
+    return StreamingResponse(completion_callback(), status_code=upstream.status_code, headers=resp_headers)
 
 def main():
     parser = argparse.ArgumentParser(description="NVIDIA API Token & Pacing Proxy")
