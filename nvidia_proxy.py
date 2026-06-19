@@ -298,17 +298,14 @@ async def proxy_handler(request: Request, path: str):
 
     wait_start = time.time()
     
-    # 1. Acquire sequential queue path positioning lock
-    await SEQUENTIAL_LOCK.acquire()
-    
-    try:
-        # 2. Process our holdout parameters
+    async with SEQUENTIAL_LOCK:
+        # Wait for previous request to fully complete + holdout period
         await enforce_completion_holdout()
         
-        # 3. Enforce RPM sliding window (real rate limit)
+        # Enforce RPM sliding window
         await enforce_rate_limit()
         
-        # 4. Secure slot allocation marker
+        # Secure concurrency slot
         await get_concurrency_semaphore().acquire()
         
         req_info.wait_time = round(time.time() - wait_start, 2)
@@ -322,130 +319,124 @@ async def proxy_handler(request: Request, path: str):
                 queue.remove(req_info)
         req_info.status = "forwarding"
 
-    finally:
-        # Release lock immediately so backlogged lines can calculate their future delta frames safely
-        SEQUENTIAL_LOCK.release()
+        # --- PROTECTED INBOUND CLIENT DISCONNECT GUARD BLOCK ---
+        try:
+            body = await request.body()
+            body = await maybe_prune_chat_context(body, f"/{path}")
+        except ClientDisconnect:
+            print(f"[proxy] Client disconnected early while waiting in pacing layout.")
+            await release_slot_and_decrement()
+            req_info.status = "Disconnected"
+            req_info.response_time = round(time.time() - wait_start, 2)
+            stats["failed_requests"] += 1
+            request_log.append(req_info)
+            last_completion_time = time.monotonic()
+            return Response(status_code=244, content="Client disconnected from proxy channel early.")
 
-    # --- PROTECTED INBOUND CLIENT DISCONNECT GUARD BLOCK ---
-    try:
-        body = await request.body()
-        body = await maybe_prune_chat_context(body, f"/{path}")
-    except ClientDisconnect:
-        print(f"[proxy] Client disconnected early while waiting in pacing layout.")
-        await release_slot_and_decrement()
-        req_info.status = "Disconnected"
-        req_info.response_time = round(time.time() - wait_start, 2)
-        stats["failed_requests"] += 1
-        request_log.append(req_info)
-        return Response(status_code=244, content="Client disconnected from proxy channel early.")
+        fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host",)}
+        fwd_headers["host"] = "integrate.api.nvidia.com"
+        if body:
+            fwd_headers["content-length"] = str(len(body))
 
-    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host",)}
-    fwd_headers["host"] = "integrate.api.nvidia.com"
-    if body:
-        fwd_headers["content-length"] = str(len(body))
+        target_url = f"{NVIDIA_BASE_URL}/{path}"
+        if request.url.query:
+            target_url += f"?{request.url.query}"
 
-    target_url = f"{NVIDIA_BASE_URL}/{path}"
-    if request.url.query:
-        target_url += f"?{request.url.query}"
-
-    client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=UPSTREAM_TIMEOUT_SECONDS), verify=SSL_CONTEXT)
-    request_start = time.time()
-    
-    try:
-        async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
-            for attempt in range(MAX_429_RETRIES + 1):
-                await enforce_rate_limit()
-                
-                upstream_req = client.build_request(method=request.method, url=target_url, headers=fwd_headers, content=body)
-                try:
-                    upstream = await client.send(upstream_req, stream=True)
-                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, ssl.SSLError) as exc:
-                    if attempt < MAX_RETRIES_NETWORK_ERRORS:
-                        stats["network_retries"] += 1
-                        retry_delay = min(2 ** attempt, 10)
-                        print(f"[proxy] Network error ({type(exc).__name__}), retrying in {retry_delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES_NETWORK_ERRORS})")
-                        await asyncio.sleep(retry_delay)
-                        continue
-                    raise
-                
-                if upstream.status_code == 429:
-                    retry_after_header = upstream.headers.get("retry-after")
-                    if retry_after_header:
-                        try:
-                            retry_after = int(retry_after_header)
-                        except ValueError:
-                            retry_after = min(2 ** attempt, 30)
-                    else:
-                        retry_after = min(2 ** attempt, 30)
-                    
-                    await upstream.aclose()
-                    
-                    if attempt < MAX_429_RETRIES:
-                        req_info.status = "rate-limited"
-                        stats["rate_limited_requests"] += 1
-                        print(f"[proxy] NVIDIA 429 encountered; holding {retry_after:.1f}s (attempt {attempt + 1}/{MAX_429_RETRIES})")
-                        await asyncio.sleep(retry_after)
-                        continue
-                    else:
-                        req_info.status = "rate-limited"
-                        stats["rate_limited_requests"] += 1
-                        print(f"[proxy] NVIDIA 429 after {MAX_429_RETRIES} retries, passing through")
-                        record_rate_limit_usage()
-                        break
-                else:
-                    record_rate_limit_usage()
-                    break
-    except Exception as exc:
-        await release_slot_and_decrement()
-        await client.aclose()
-        req_info.status = "failed"
-        req_info.response_time = round(time.time() - wait_start, 2)
-        stats["failed_requests"] += 1
-        request_log.append(req_info)
-        last_completion_time = time.monotonic()
-        error_type = type(exc).__name__
-        error_detail = str(exc)
-        print(f"[proxy] Upstream request failed: {error_type}: {error_detail}")
-        return Response(content=f"Error connecting to NVIDIA backend: {error_type}: {error_detail}", status_code=502)
-
-    if upstream.status_code >= 400:
-        await release_slot_and_decrement()
-        err_body = await upstream.aread()
-        await upstream.aclose()
-        await client.aclose()
-        req_info.status = "failed"
-        req_info.response_time = round(time.time() - wait_start, 2)
-        stats["failed_requests"] += 1
-        request_log.append(req_info)
-        last_completion_time = time.monotonic()
-        return Response(content=err_body, status_code=upstream.status_code)
-
-    resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"}
-
-    async def relay():
+        client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=UPSTREAM_TIMEOUT_SECONDS), verify=SSL_CONTEXT)
+        
         try:
             async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
-                async for chunk in upstream.aiter_raw():
-                    yield chunk
-            req_info.status = "success"
-            stats["successful_requests"] += 1
-        except Exception:
+                for attempt in range(MAX_429_RETRIES + 1):
+                    upstream_req = client.build_request(method=request.method, url=target_url, headers=fwd_headers, content=body)
+                    try:
+                        upstream = await client.send(upstream_req, stream=True)
+                    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, ssl.SSLError) as exc:
+                        if attempt < MAX_RETRIES_NETWORK_ERRORS:
+                            stats["network_retries"] += 1
+                            retry_delay = min(2 ** attempt, 10)
+                            print(f"[proxy] Network error ({type(exc).__name__}), retrying in {retry_delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES_NETWORK_ERRORS})")
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        raise
+                    
+                    if upstream.status_code == 429:
+                        retry_after_header = upstream.headers.get("retry-after")
+                        if retry_after_header:
+                            try:
+                                retry_after = int(retry_after_header)
+                            except ValueError:
+                                retry_after = min(2 ** attempt, 30)
+                        else:
+                            retry_after = min(2 ** attempt, 30)
+                        
+                        await upstream.aclose()
+                        
+                        if attempt < MAX_429_RETRIES:
+                            req_info.status = "rate-limited"
+                            stats["rate_limited_requests"] += 1
+                            print(f"[proxy] NVIDIA 429 encountered; holding {retry_after:.1f}s (attempt {attempt + 1}/{MAX_429_RETRIES})")
+                            await asyncio.sleep(retry_after)
+                            continue
+                        else:
+                            req_info.status = "rate-limited"
+                            stats["rate_limited_requests"] += 1
+                            print(f"[proxy] NVIDIA 429 after {MAX_429_RETRIES} retries, passing through")
+                            record_rate_limit_usage()
+                            break
+                    else:
+                        record_rate_limit_usage()
+                        break
+        except Exception as exc:
+            await release_slot_and_decrement()
+            await client.aclose()
             req_info.status = "failed"
-            stats["failed_requests"] += 1
-        finally:
             req_info.response_time = round(time.time() - wait_start, 2)
+            stats["failed_requests"] += 1
             request_log.append(req_info)
+            last_completion_time = time.monotonic()
+            error_type = type(exc).__name__
+            error_detail = str(exc)
+            print(f"[proxy] Upstream request failed: {error_type}: {error_detail}")
+            return Response(content=f"Error connecting to NVIDIA backend: {error_type}: {error_detail}", status_code=502)
+
+        if upstream.status_code >= 400:
+            await release_slot_and_decrement()
+            err_body = await upstream.aread()
             await upstream.aclose()
             await client.aclose()
-            await release_slot_and_decrement()
+            req_info.status = "failed"
+            req_info.response_time = round(time.time() - wait_start, 2)
+            stats["failed_requests"] += 1
+            request_log.append(req_info)
+            last_completion_time = time.monotonic()
+            return Response(content=err_body, status_code=upstream.status_code)
 
-    async def completion_callback():
-        global last_completion_time
-        async for _ in relay():
-            yield _
-        last_completion_time = time.monotonic()
+        resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"}
 
-    return StreamingResponse(completion_callback(), status_code=upstream.status_code, headers=resp_headers)
+        async def relay():
+            try:
+                async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
+                    async for chunk in upstream.aiter_raw():
+                        yield chunk
+                req_info.status = "success"
+                stats["successful_requests"] += 1
+            except Exception:
+                req_info.status = "failed"
+                stats["failed_requests"] += 1
+            finally:
+                req_info.response_time = round(time.time() - wait_start, 2)
+                request_log.append(req_info)
+                await upstream.aclose()
+                await client.aclose()
+                await release_slot_and_decrement()
+
+        async def completion_callback():
+            global last_completion_time
+            async for _ in relay():
+                yield _
+            last_completion_time = time.monotonic()
+
+        return StreamingResponse(completion_callback(), status_code=upstream.status_code, headers=resp_headers)
 
 def main():
     parser = argparse.ArgumentParser(description="NVIDIA API Token & Pacing Proxy")
