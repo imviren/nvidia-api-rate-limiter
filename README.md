@@ -5,13 +5,15 @@ A lightweight reverse proxy that intercepts NVIDIA API calls and applies **slidi
 ## Features
 
 - **Sliding-Window RPM Enforcement**: Enforces a true 60s rolling window (default 40 RPM to match NVIDIA free tier). The `--rpm` flag actually controls the limit — not just cosmetic
-- **Completion-Based Holdout**: Secondary pacing engine that enforces a configurable cooldown gap (default 1.67s) between request completions, smoothing burst edges
-- **Single-Stream Concurrency**: One request at a time through the upstream to guarantee pacing integrity
-- **429 Retry Logic**: Exponential backoff (up to 5 retries, capped at 30s) on NVIDIA rate-limit responses
+- **Completion-Based Holdout**: Secondary pacing engine that enforces a configurable cooldown gap (default 1.67s) between request **completions**, smoothing burst edges
+- **Strict Sequential Locking**: One request active at a time — the lock is held for the entire request lifecycle including streaming response
+- **429 Retry Logic**: Exponential backoff (up to 5 retries, capped at 30s) on NVIDIA rate-limit responses — re-checks holdout before each retry
 - **Context Pruning (Opt-in)**: Optionally prune chat history to stay under token limits — opt-in via `--no-context-pruning` (default: on with 160K ceiling)
+- **Connection Pooling**: Shared HTTP client with keepalive for fast TLS reuse
 - **Real-time Dashboard**: Dark-themed web UI with live stats, queue, and request log via WebSocket at `http://127.0.0.1:8000/`
 - **Request Queuing**: Requests wait in a FIFO queue behind the sequential lock
-- **Live Statistics**: Track total, successful, rate-limited, failed, and context-pruned requests
+- **Live Statistics**: Track total, successful, rate-limited, failed, network-retried, and context-pruned requests
+- **Per-Request Timestamps**: Dashboard shows `request_sent_time` and `request_complete_time` for debugging pacing gaps
 - **Client Disconnect Guard**: Graceful handling of early client disconnects without blocking the pacing engine
 
 ## Installation
@@ -238,6 +240,23 @@ python nvidia_proxy.py --rpm 30 --port 8000 --host 127.0.0.1 --cooldown 2.0
 ---
 
 ## Changelog
+
+### v1.6 — Audit Fixes + Connection Pooling
+
+- **Fixed**: 429 retries now **re-check holdout** before each attempt — previously bursts could trigger more 429s
+- **Fixed**: All error paths (client disconnect, exception, 4xx, 429 exhaustion) now set `request_complete_time` before releasing resources
+- **Fixed**: OPTIONS preflight requests no longer counted in stats
+- **New**: **Shared HTTP connection pool** — reuses TLS connections for faster requests
+- **New**: Dashboard exposes `request_sent_time` and `request_complete_time` per request for debugging
+- **Improved**: Slot/release ordering — timestamps set BEFORE releasing slot and lock for accurate accounting
+
+### v1.5 — Critical Holdout Fix
+
+- **Fixed (CRITICAL)**: Holdout was setting `last_completion_time` BEFORE request started. Now returns a `record_completion()` callback that sets the timestamp only AFTER the response stream fully completes — guarantees 1.67s gap between actual completions.
+
+### v1.4 — Sequential Lock Scoping
+
+- **Fixed**: `SEQUENTIAL_LOCK` now wraps the entire request lifecycle (acquired with `async with`). Previously released after forwarding, allowing concurrent requests to bypass the cooldown buffer.
 
 ### v1.3 — Smart 429 Handling + Network Retry Logic
 
