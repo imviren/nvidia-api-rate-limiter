@@ -5,9 +5,12 @@ A lightweight reverse proxy that intercepts NVIDIA API calls, applies configurab
 ## Features
 
 - **Rate Limiting**: Configurable requests per minute (RPM) via command-line arguments
+- **Concurrency Limiting**: Configurable maximum concurrent upstream requests to stay within NVIDIA limits
+- **Sequential Processing Mode**: Optional strict sequential processing (1 request at a time) for maximum safety
+- **Context Pruning & Summarization**: Automatically prunes chat completion messages to stay under token-per-minute (TPM) limits
 - **Real-time Dashboard**: Modern web UI showing API call details, queue status, and current RPM
 - **Request Queuing**: Requests wait in queue when rate limit is reached
-- **Live Statistics**: Track total, successful, rate-limited, and failed requests
+- **Live Statistics**: Track total, successful, rate-limited, failed, and context-pruned requests
 - **WebSocket Updates**: Dashboard updates in real-time every second
 
 ## Installation
@@ -41,6 +44,37 @@ python nvidia_proxy.py --rpm 20
 python nvidia_proxy.py --rpm 30 --port 8000 --host 127.0.0.1
 ```
 
+## Context Pruning (for Long Conversations)
+
+When using long-running conversations or agentic workflows, token count can grow rapidly. The proxy now automatically prunes chat context to stay within limits:
+
+- **Sliding window**: Keeps the last N messages (configurable)
+- **Smart summarization**: Summarizes older messages instead of dropping them
+- **Token-aware**: Uses rough token estimation to stay under limits
+
+```bash
+# Enable context pruning (default)
+python nvidia_proxy.py --context-pruning
+
+# Disable context pruning
+python nvidia_proxy.py --no-context-pruning
+
+# Adjust context window
+python nvidia_proxy.py --max-context-tokens 6000 --keep-last-messages 8
+```
+
+## Concurrency & Sequential Modes
+
+By default, the proxy allows up to 4 concurrent upstream requests. You can adjust this:
+
+```bash
+# Limit to 2 concurrent requests (default: 4)
+python nvidia_proxy.py --concurrency 2
+
+# Force strict sequential processing (one at a time)
+python nvidia_proxy.py --sequential
+```
+
 ### Command-Line Arguments
 
 | Argument | Short | Default | Description |
@@ -49,6 +83,12 @@ python nvidia_proxy.py --rpm 30 --port 8000 --host 127.0.0.1
 | `--port` | `-p` | 8000 | Port to run the proxy on |
 | `--host` | | 127.0.0.1 | Host to bind to |
 | `--timeout` | `-t` | 500 | Upstream timeout in seconds |
+| `--concurrency` | `-c` | 4 | Maximum concurrent upstream requests |
+| `--sequential` | | | Force sequential processing (max concurrency = 1) |
+| `--max-context-tokens` | | 8000 | Maximum tokens to allow in chat context |
+| `--keep-last-messages` | | 10 | Number of recent messages to always keep in chat context |
+| `--context-pruning` | | (enabled) | Enable context pruning for chat requests |
+| `--no-context-pruning` | | | Disable context pruning for chat requests |
 
 ## Configuration
 
@@ -82,7 +122,8 @@ Access the dashboard at: **http://127.0.0.1:8000/**
 
 The dashboard displays:
 - Rate limit configuration and current RPM
-- Total, successful, rate-limited, and failed requests
+- Concurrency status (e.g., `2 / 4` concurrent requests)
+- Total, successful, rate-limited, failed, and context-pruned requests
 - Request queue with waiting requests
 - Recent API calls with status, wait time, and timestamps
 
@@ -91,14 +132,29 @@ The dashboard displays:
 1. **Intercept**: OpenCode sends requests to the local proxy instead of directly to NVIDIA
 2. **Queue**: Requests are added to a queue
 3. **Rate Limit**: Token bucket algorithm controls request flow
-4. **Forward**: Approved requests are forwarded to NVIDIA API
-5. **Response**: NVIDIA's response is returned to OpenCode
-6. **Track**: All requests are logged and displayed on the dashboard
+4. **Context Prune**: Chat completion requests have large contexts pruned/summarized to respect TPM limits
+5. **Forward**: Approved requests are forwarded to NVIDIA API
+6. **Response**: NVIDIA's response is returned to OpenCode
+7. **Track**: All requests are logged and displayed on the dashboard
+
+## Recommended Settings for Long-Running Workflows
+
+To avoid 429 errors during long conversations or agentic workflows:
+
+```bash
+# Conservative settings for long conversations
+python nvidia_proxy.py --rpm 20 --concurrency 2 --max-context-tokens 6000 --keep-last-messages 8
+```
+
+For maximum safety (strictly sequential):
+```bash
+python nvidia_proxy.py --sequential --rpm 15 --max-context-tokens 6000
+```
 
 ## Architecture
 
 ```
-OpenCode → Local Proxy (Rate Limit) → NVIDIA API
+OpenCode → Local Proxy (Rate Limit + Concurrency + Context Pruning) → NVIDIA API
               ↓
          Dashboard (Real-time UI)
 ```
@@ -193,6 +249,9 @@ python nvidia_proxy.py
 
 :: Or with custom settings
 python nvidia_proxy.py --rpm 20 --port 8000 --host 127.0.0.1
+
+:: For long conversations with context pruning
+python nvidia_proxy.py --rpm 20 --concurrency 2 --max-context-tokens 6000 --keep-last-messages 8
 ```
 
 ### 3. Verify Setup

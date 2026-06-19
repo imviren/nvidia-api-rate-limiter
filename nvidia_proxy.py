@@ -10,6 +10,8 @@ import uvicorn
 import ssl
 from collections import deque
 import uuid
+import json
+import re
 
 # TLS trust: this machine runs AVG Antivirus, which intercepts HTTPS and
 # re-signs certs with a private root CA that OpenSSL/certifi reject. Verify via
@@ -24,14 +26,202 @@ except Exception:  # pragma: no cover - fallback for non-intercepted environment
 
 app = FastAPI()
 
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token count for text. Rough approximation: 4 chars per token for English."""
+    if not text:
+        return 0
+    # Simple approximation: count characters and divide by 4
+    # This is rough but works for most English text without needing tiktoken
+    return max(1, len(text) // 4)
+
+
+def estimate_messages_tokens(messages: list) -> int:
+    """Estimate total tokens in a list of chat messages."""
+    total = 0
+    for msg in messages:
+        # Add tokens for role and content
+        total += estimate_tokens(msg.get("role", ""))
+        total += estimate_tokens(msg.get("content", ""))
+        # Add overhead for message formatting (approximately 3 tokens per message)
+        total += 3
+    return total
+
+
+def prune_chat_messages(messages: list, max_tokens: int = 8000, keep_last: int = 10) -> list:
+    """
+    Prune chat messages to stay under token limit using sliding window.
+    
+    Strategy:
+    1. Always keep the system message (if present) at the beginning
+    2. Keep the last `keep_last` user/assistant turns
+    3. If still over limit, summarize older messages into a summary message
+    4. If still over limit, truncate from the beginning
+    
+    Returns pruned list of messages.
+    """
+    if not messages:
+        return messages
+    
+    # Separate system messages from others
+    system_messages = [msg for msg in messages if msg.get("role") == "system"]
+    other_messages = [msg for msg in messages if msg.get("role") != "system"]
+    
+    # If we have no system messages, just work with all messages
+    if not system_messages:
+        system_messages = []
+        other_messages = messages
+    
+    # Estimate current token usage
+    current_tokens = estimate_messages_tokens(messages)
+    
+    # If already under limit, return as-is
+    if current_tokens <= max_tokens:
+        return messages
+    
+    # Strategy 1: Keep system messages + last N messages
+    if len(other_messages) <= keep_last:
+        # We have few messages, just return all (shouldn't happen if over limit, but safe)
+        return messages
+    
+    # Keep last `keep_last` messages from other_messages
+    kept_other = other_messages[-keep_last:]
+    pruned_messages = system_messages + kept_other
+    
+    # Check if we're under limit now
+    pruned_tokens = estimate_messages_tokens(pruned_messages)
+    if pruned_tokens <= max_tokens:
+        return pruned_messages
+    
+    # Strategy 2: Create a summary of removed messages
+    removed_messages = other_messages[:-keep_last]
+    if removed_messages:
+        # Create summary content
+        summary_parts = []
+        for msg in removed_messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if content:
+                summary_parts.append(f"{role}: {content[:100]}{'...' if len(content) > 100 else ''}")
+        
+        summary_content = "Previous conversation summary: " + " | ".join(summary_parts)
+        summary_message = {
+            "role": "system",
+            "content": summary_content
+        }
+        
+        # Put summary at the beginning, after system messages
+        summarized_messages = system_messages + [summary_message] + kept_other
+        
+        # Check if we're under limit now
+        summarized_tokens = estimate_messages_tokens(summarized_messages)
+        if summarized_tokens <= max_tokens:
+            return summarized_messages
+    
+    # Strategy 3: If still over limit, keep fewer messages and try again
+    # Recursively try with fewer kept messages
+    if keep_last > 1:
+        return prune_chat_messages(messages, max_tokens, keep_last - 1)
+    
+    # Strategy 4: Last resort - truncate aggressively
+    # Keep only system messages and the very last message
+    if other_messages:
+        return system_messages + [other_messages[-1]]
+    else:
+        return system_messages
+
+
+async def maybe_prune_chat_context(body: bytes, path: str) -> bytes:
+    """
+    If this is a chat completion request, attempt to prune the context to reduce tokens.
+    Returns the (possibly modified) body as bytes.
+    """
+    # Only process if context pruning is enabled
+    if not ENABLE_CONTEXT_PRUNING:
+        return body
+    
+    # Only process chat completion endpoints
+    if "chat/completions" not in path:
+        return body
+    
+    try:
+        # Try to parse as JSON
+        if not body:
+            return body
+            
+        text_body = body.decode("utf-8")
+        data = json.loads(text_body)
+        
+        # Check if this looks like a chat completion request
+        if "messages" not in data or not isinstance(data["messages"], list):
+            return body
+        
+        original_messages = data["messages"]
+        if not original_messages:
+            return body
+        
+        # Estimate tokens
+        estimated_tokens = estimate_messages_tokens(original_messages)
+        
+        # If under reasonable limit (MAX_CONTEXT_TOKENS + 4000 for response), don't prune
+        if estimated_tokens < (MAX_CONTEXT_TOKENS + 4000):
+            return body
+        
+        # Prune messages to target MAX_CONTEXT_TOKENS tokens (leaving room for response)
+        pruned_messages = prune_chat_messages(original_messages, max_tokens=MAX_CONTEXT_TOKENS, keep_last=KEEP_LAST_MESSAGES)
+        
+        # If pruning didn't change anything, return original
+        if pruned_messages == original_messages:
+            return body
+        
+        # Update the messages and re-serialize
+        data["messages"] = pruned_messages
+        new_body = json.dumps(data).encode("utf-8")
+        
+        # Log the reduction for debugging
+        original_tokens = estimate_messages_tokens(original_messages)
+        pruned_tokens = estimate_messages_tokens(pruned_messages)
+        print(f"[context-pruning] Reduced tokens from {original_tokens} to {pruned_tokens} "
+              f"({len(original_messages)} -> {len(pruned_messages)} messages)")
+        stats["context_prunings"] += 1
+        
+        return new_body
+        
+    except (json.JSONDecodeError, UnicodeDecodeError, KeyError):
+        # If we can't parse or process, return original body
+        return body
+    except Exception as e:
+        # Log unexpected errors but don't break the request
+        print(f"[context-pruning] Error processing chat context: {e}")
+        return body
+
 # Global configuration (set via command-line args)
 RATE_LIMIT_REQUESTS = 40
 RATE_LIMIT_WINDOW_SECONDS = 60
 UPSTREAM_TIMEOUT_SECONDS = 500
 MAX_429_RETRIES = 5
+MAX_CONCURRENT_REQUESTS = 4
+MAX_CONTEXT_TOKENS = 8000
+KEEP_LAST_MESSAGES = 10
+ENABLE_CONTEXT_PRUNING = True
 
 INFLIGHT_REQUESTS = 0
 inflight_lock = asyncio.Lock()
+concurrency_semaphore = None
+
+
+def get_concurrency_semaphore():
+    global concurrency_semaphore
+    if concurrency_semaphore is None:
+        concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    return concurrency_semaphore
+
+
+async def release_slot_and_decrement():
+    async with inflight_lock:
+        global INFLIGHT_REQUESTS
+        INFLIGHT_REQUESTS = max(0, INFLIGHT_REQUESTS - 1)
+    get_concurrency_semaphore().release()
 
 # Pacing (leaky-bucket) state.  A token bucket that starts full would let a
 # burst of RATE_LIMIT_REQUESTS requests hit NVIDIA at once and trip its 429
@@ -63,6 +253,7 @@ stats = {
     "successful_requests": 0,
     "rate_limited_requests": 0,
     "failed_requests": 0,
+    "context_prunings": 0,
     "start_time": datetime.now().isoformat(),
 }
 
@@ -311,30 +502,38 @@ async def dashboard(request: Request):
                 <h2>Rate Limit Configuration</h2>
                 <div class="limit" id="rateLimitDisplay">-- RPM</div>
             </div>
+            <div style="text-align: center;">
+                <h2>Concurrency</h2>
+                <div class="limit" id="concurrencyDisplay">0 / 4</div>
+            </div>
             <div style="text-align: right;">
                 <h2>Current RPM</h2>
                 <div class="limit" id="currentRpmDisplay">0</div>
             </div>
         </div>
 
-        <div class="stats-grid">
-            <div class="stat-card">
-                <h3>Total Requests</h3>
-                <div class="value" id="totalRequests">0</div>
-            </div>
-            <div class="stat-card">
-                <h3>Successful</h3>
-                <div class="value" id="successfulRequests">0</div>
-            </div>
-            <div class="stat-card">
-                <h3>Rate Limited</h3>
-                <div class="value warning" id="rateLimitedRequests">0</div>
-            </div>
-            <div class="stat-card">
-                <h3>Failed</h3>
-                <div class="value danger" id="failedRequests">0</div>
-            </div>
-        </div>
+<div class="stats-grid">
+             <div class="stat-card">
+                 <h3>Total Requests</h3>
+                 <div class="value" id="totalRequests">0</div>
+             </div>
+             <div class="stat-card">
+                 <h3>Successful</h3>
+                 <div class="value" id="successfulRequests">0</div>
+             </div>
+             <div class="stat-card">
+                 <h3>Rate Limited</h3>
+                 <div class="value warning" id="rateLimitedRequests">0</div>
+             </div>
+             <div class="stat-card">
+                 <h3>Failed</h3>
+                 <div class="value danger" id="failedRequests">0</div>
+             </div>
+             <div class="stat-card">
+                 <h3>Context Pruned</h3>
+                 <div class="value" id="contextPrunings">0</div>
+             </div>
+         </div>
 
         <div class="section">
             <h2>Request Queue</h2>
@@ -386,10 +585,12 @@ async def dashboard(request: Request):
         function updateDashboard(data) {
             document.getElementById('rateLimitDisplay').textContent = `${data.rate_limit_rpm} RPM`;
             document.getElementById('currentRpmDisplay').textContent = data.current_rpm;
+            document.getElementById('concurrencyDisplay').textContent = `${data.current_inflight} / ${data.max_concurrency}`;
             document.getElementById('totalRequests').textContent = data.stats.total_requests;
             document.getElementById('successfulRequests').textContent = data.stats.successful_requests;
             document.getElementById('rateLimitedRequests').textContent = data.stats.rate_limited_requests;
             document.getElementById('failedRequests').textContent = data.stats.failed_requests;
+            document.getElementById('contextPrunings').textContent = data.stats.context_prunings;
             
             // Update queue
             const queueContainer = document.getElementById('queueContainer');
@@ -437,6 +638,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 "rate_limit_rpm": RATE_LIMIT_REQUESTS,
                 "current_rpm": get_current_rpm(),
                 "upstream_timeout": UPSTREAM_TIMEOUT_SECONDS,
+                "max_concurrency": MAX_CONCURRENT_REQUESTS,
+                "current_inflight": INFLIGHT_REQUESTS,
                 "stats": stats,
                 "queue": [r.to_dict() for r in queue],
                 "request_log": [r.to_dict() for r in request_log][-50:]
@@ -491,6 +694,11 @@ async def proxy_handler(request: Request, path: str):
         await asyncio.sleep(wait_seconds)
 
     req_info.wait_time = round(time.time() - wait_start, 2)
+
+    await get_concurrency_semaphore().acquire()
+    async with inflight_lock:
+        global INFLIGHT_REQUESTS
+        INFLIGHT_REQUESTS += 1
     async with queue_lock:
         if req_info in queue:
             queue.remove(req_info)
@@ -498,6 +706,8 @@ async def proxy_handler(request: Request, path: str):
 
     # Read the body and copy headers verbatim, minus hop-by-hop/recomputed ones.
     body = await request.body()
+    # Apply context pruning for chat completion requests to reduce token usage
+    body = await maybe_prune_chat_context(body, f"/{path}")
     fwd_headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in HOP_BY_HOP and k.lower() not in ("host", "content-length")
@@ -537,6 +747,7 @@ async def proxy_handler(request: Request, path: str):
                 await back_off(retry_after)
                 await asyncio.sleep(retry_after)
     except TimeoutError:
+        await release_slot_and_decrement()
         await client.aclose()
         req_info.status = "failed"
         req_info.response_time = round(time.time() - request_start, 2)
@@ -548,6 +759,7 @@ async def proxy_handler(request: Request, path: str):
             status_code=504,
         )
     except httpx.RequestError as exc:
+        await release_slot_and_decrement()
         await client.aclose()
         req_info.status = "failed"
         req_info.response_time = round(time.time() - request_start, 2)
@@ -564,6 +776,7 @@ async def proxy_handler(request: Request, path: str):
     # limit was hit (RPM vs tokens-per-minute vs concurrency vs credits), so we
     # surface its status, every rate-limit header, and the body to the console.
     if upstream.status_code >= 400:
+        await release_slot_and_decrement()
         err_body = await upstream.aread()
         await upstream.aclose()
         await client.aclose()
@@ -646,6 +859,7 @@ async def proxy_handler(request: Request, path: str):
             request_log.append(req_info)
             await upstream.aclose()
             await client.aclose()
+            await release_slot_and_decrement()
 
     return StreamingResponse(
         relay(),
@@ -664,6 +878,7 @@ def reset_stats():
         "successful_requests": 0,
         "rate_limited_requests": 0,
         "failed_requests": 0,
+        "context_prunings": 0,
         "start_time": datetime.now().isoformat(),
     }
 
@@ -694,14 +909,58 @@ def main():
         default=500,
         help="Upstream timeout in seconds (default: 500)"
     )
+    parser.add_argument(
+        "--concurrency", "-c",
+        type=int,
+        default=4,
+        help="Maximum concurrent upstream requests (default: 4)"
+    )
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="Force sequential processing (max concurrency = 1)"
+    )
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=8000,
+        help="Maximum tokens to allow in chat context (default: 8000)"
+    )
+    parser.add_argument(
+        "--keep-last-messages",
+        type=int,
+        default=10,
+        help="Number of recent messages to always keep in chat context (default: 10)"
+    )
+    parser.add_argument(
+        "--context-pruning",
+        dest="context_pruning",
+        action="store_true",
+        help="Enable context pruning for chat requests (default: True)"
+    )
+    parser.add_argument(
+        "--no-context-pruning",
+        dest="context_pruning",
+        action="store_false",
+        help="Disable context pruning for chat requests"
+    )
+    parser.set_defaults(context_pruning=True)
 
     args = parser.parse_args()
 
-    global RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SECONDS, UPSTREAM_TIMEOUT_SECONDS
+    global RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SECONDS, UPSTREAM_TIMEOUT_SECONDS, MAX_CONCURRENT_REQUESTS
+    global ENABLE_CONTEXT_PRUNING, MAX_CONTEXT_TOKENS, KEEP_LAST_MESSAGES
 
     RATE_LIMIT_REQUESTS = args.rpm
     RATE_LIMIT_WINDOW_SECONDS = 60
     UPSTREAM_TIMEOUT_SECONDS = args.timeout
+    if args.sequential:
+        MAX_CONCURRENT_REQUESTS = 1
+    else:
+        MAX_CONCURRENT_REQUESTS = args.concurrency
+    MAX_CONTEXT_TOKENS = args.max_context_tokens
+    KEEP_LAST_MESSAGES = args.keep_last_messages
+    ENABLE_CONTEXT_PRUNING = args.context_pruning
 
     reset_stats()
 
@@ -712,6 +971,11 @@ def main():
     print(f"  Proxy URL:    http://{args.host}:{args.port}/v1")
     print(f"  Rate Limit:   {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW_SECONDS}s")
     print(f"  Spacing:      1 request every {RATE_LIMIT_WINDOW_SECONDS / max(1, RATE_LIMIT_REQUESTS):.2f}s")
+    if args.sequential:
+        concurrency_note = " (sequential mode)"
+    else:
+        concurrency_note = ""
+    print(f"  Concurrency:  {MAX_CONCURRENT_REQUESTS} simultaneous upstream requests{concurrency_note}")
     print(f"  Timeout:      {UPSTREAM_TIMEOUT_SECONDS}s")
     print(f"{'='*60}\n")
     
