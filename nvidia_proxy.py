@@ -55,9 +55,13 @@ async def release_slot_and_decrement():
         INFLIGHT_REQUESTS = max(0, INFLIGHT_REQUESTS - 1)
     get_concurrency_semaphore().release()
 
-async def enforce_completion_holdout():
-    """Guarantees a strict COOLDOWN_BUFFER cushion between the completion and the next start."""
+async def wait_for_holdout_and_record_completion():
+    """
+    Wait for holdout period BEFORE starting, then record completion AFTER request finishes.
+    Returns a callback that should be called when the request fully completes.
+    """
     global last_completion_time
+    
     now = time.monotonic()
     elapsed = now - last_completion_time
     
@@ -66,7 +70,11 @@ async def enforce_completion_holdout():
         print(f"[pacing-engine] Strict holdout active. Waiting {wait_needed:.2f}s...")
         await asyncio.sleep(wait_needed)
     
-    last_completion_time = time.monotonic()
+    def record_completion():
+        nonlocal last_completion_time
+        last_completion_time = time.monotonic()
+    
+    return record_completion
 
 
 # --- SLIDING-WINDOW RPM ENFORCEMENT ---
@@ -299,8 +307,8 @@ async def proxy_handler(request: Request, path: str):
     wait_start = time.time()
     
     async with SEQUENTIAL_LOCK:
-        # Wait for previous request to fully complete + holdout period
-        await enforce_completion_holdout()
+        # Wait for holdout period (blocks until previous request completed + cooldown)
+        record_completion = await wait_for_holdout_and_record_completion()
         
         # Enforce RPM sliding window
         await enforce_rate_limit()
@@ -330,7 +338,7 @@ async def proxy_handler(request: Request, path: str):
             req_info.response_time = round(time.time() - wait_start, 2)
             stats["failed_requests"] += 1
             request_log.append(req_info)
-            last_completion_time = time.monotonic()
+            record_completion()
             return Response(status_code=244, content="Client disconnected from proxy channel early.")
 
         fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host",)}
@@ -382,6 +390,7 @@ async def proxy_handler(request: Request, path: str):
                             stats["rate_limited_requests"] += 1
                             print(f"[proxy] NVIDIA 429 after {MAX_429_RETRIES} retries, passing through")
                             record_rate_limit_usage()
+                            record_completion()
                             break
                     else:
                         record_rate_limit_usage()
@@ -393,7 +402,7 @@ async def proxy_handler(request: Request, path: str):
             req_info.response_time = round(time.time() - wait_start, 2)
             stats["failed_requests"] += 1
             request_log.append(req_info)
-            last_completion_time = time.monotonic()
+            record_completion()
             error_type = type(exc).__name__
             error_detail = str(exc)
             print(f"[proxy] Upstream request failed: {error_type}: {error_detail}")
@@ -408,7 +417,7 @@ async def proxy_handler(request: Request, path: str):
             req_info.response_time = round(time.time() - wait_start, 2)
             stats["failed_requests"] += 1
             request_log.append(req_info)
-            last_completion_time = time.monotonic()
+            record_completion()
             return Response(content=err_body, status_code=upstream.status_code)
 
         resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"}
@@ -429,14 +438,9 @@ async def proxy_handler(request: Request, path: str):
                 await upstream.aclose()
                 await client.aclose()
                 await release_slot_and_decrement()
+                record_completion()
 
-        async def completion_callback():
-            global last_completion_time
-            async for _ in relay():
-                yield _
-            last_completion_time = time.monotonic()
-
-        return StreamingResponse(completion_callback(), status_code=upstream.status_code, headers=resp_headers)
+        return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
 
 def main():
     parser = argparse.ArgumentParser(description="NVIDIA API Token & Pacing Proxy")
