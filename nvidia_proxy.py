@@ -457,6 +457,8 @@ async def proxy_handler(request: Request, path: str):
 
         resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"}
 
+        stream_complete_event = asyncio.Event()
+
         async def relay():
             try:
                 async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
@@ -474,8 +476,11 @@ async def proxy_handler(request: Request, path: str):
                 await upstream.aclose()
                 await release_slot_and_decrement()
                 record_completion()
+                stream_complete_event.set()
 
-        return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
+        response = StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
+        await stream_complete_event.wait()
+        return response
 
 def main():
     parser = argparse.ArgumentParser(description="NVIDIA API Token & Pacing Proxy")
