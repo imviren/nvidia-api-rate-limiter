@@ -37,9 +37,17 @@ SEQUENTIAL_LOCK = asyncio.Lock()
 last_completion_time = 0.0      # monotonic clock — when the previous request FULLY completed
 last_send_time = 0.0           # monotonic clock — when the previous request was SENT to NVIDIA
 COOLDOWN_BUFFER = 1.67
-CIRCUIT_BREAKER_OPEN = False
 stream_complete_event = asyncio.Event()
 stream_complete_event.set()
+
+# ---- PER-MODEL COOLDOWN ----
+# A gateway 429 from NVIDIA is a per-model quota, not a global rate the proxy can
+# pace under. So instead of locking the WHOLE proxy (the old hard circuit breaker),
+# we bench ONLY the offending model for MODEL_COOLDOWN_SECONDS. Requests for every
+# other model keep flowing, and the bench clears automatically — no restart needed.
+MODEL_COOLDOWN_SECONDS = 7200            # how long a model stays benched after a 429 (2h default)
+model_cooldowns = {}                     # model name -> epoch (time.time()) when the bench expires
+model_cooldown_lock = asyncio.Lock()
 
 def log(msg, req_info=None, tag="proxy"):
     """Timestamped console logger for pacing/debugging. flush=True so lines
@@ -61,6 +69,60 @@ def release_slot_sync():
     global INFLIGHT_REQUESTS
     INFLIGHT_REQUESTS = max(0, INFLIGHT_REQUESTS - 1)
     get_concurrency_semaphore().release()
+
+def extract_model(body: bytes):
+    """Pull the 'model' field out of a JSON request body, if present. Returns
+    None for empty/non-JSON bodies or bodies without a usable string model —
+    in which case the per-model cooldown gate simply lets the request pass."""
+    if not body:
+        return None
+    try:
+        data = json.loads(body)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        m = data.get("model")
+        if isinstance(m, str) and m:
+            return m
+    return None
+
+async def get_model_cooldown(model):
+    """If `model` is currently benched, return the epoch time its cooldown
+    expires; otherwise return None. Expired entries are evicted on read."""
+    if not model:
+        return None
+    async with model_cooldown_lock:
+        expiry = model_cooldowns.get(model)
+        if expiry is None:
+            return None
+        if time.time() >= expiry:
+            model_cooldowns.pop(model, None)
+            return None
+        return expiry
+
+async def put_model_cooldown(model, seconds):
+    """Bench `model` for `seconds` from now. Returns the epoch expiry, or None
+    if we couldn't identify the model (nothing to key the cooldown on)."""
+    if not model:
+        return None
+    expiry = time.time() + seconds
+    async with model_cooldown_lock:
+        model_cooldowns[model] = expiry
+    return expiry
+
+def get_cooldowns_snapshot():
+    """Live snapshot of benched models for the dashboard (no lock — read only)."""
+    now = time.time()
+    out = []
+    for m, expiry in list(model_cooldowns.items()):
+        remaining = int(round(expiry - now))
+        if remaining > 0:
+            out.append({
+                "model": m,
+                "remaining_seconds": remaining,
+                "until": datetime.fromtimestamp(expiry).strftime("%H:%M:%S"),
+            })
+    return out
 
 async def wait_for_holdout(req_info=None):
     """
@@ -211,6 +273,7 @@ class RequestInfo:
         self.id = str(uuid.uuid4())[:8]
         self.method = method
         self.path = path
+        self.model = None
         self.status = status
         self.wait_time = wait_time
         self.timestamp = datetime.now()
@@ -223,7 +286,7 @@ class RequestInfo:
 
     def to_dict(self):
         return {
-            "id": self.id, "method": self.method, "path": self.path, "status": self.status,
+            "id": self.id, "method": self.method, "path": self.path, "model": self.model, "status": self.status,
             "wait_time": round(self.wait_time, 2), "timestamp": self.timestamp.isoformat(),
             "response_time": self.response_time, "request_sent_time": self.request_sent_time,
             "request_complete_time": self.request_complete_time,
@@ -265,7 +328,7 @@ async def dashboard(request: Request):
         table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
         th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.06); white-space: nowrap; }
         th { color: #666; font-weight: 500; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.5px; }
-        .status-success { color: #00ff88; } .status-failed { color: #ff4444; } .status-rate-limited { color: #ff8800; } .status-disconnected { color: #ffaa00; } .status-forwarding { color: #00aaff; } .status-queued { color: #666; }
+        .status-success { color: #00ff88; } .status-failed { color: #ff4444; } .status-rate-limited { color: #ff8800; } .status-cooldown { color: #ff8800; } .status-disconnected { color: #ffaa00; } .status-forwarding { color: #00aaff; } .status-queued { color: #666; }
         .badge-ok { display: inline-block; background: #00ff8822; color: #00ff88; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; }
         .badge-fail { display: inline-block; background: #ff444422; color: #ff4444; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; }
         .badge-na { display: inline-block; background: #66666622; color: #666; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; }
@@ -281,7 +344,7 @@ async def dashboard(request: Request):
             <div><h3>Active</h3><div class="limit" id="concurrencyDisplay">0 / 1</div></div>
             <div><h3>Window RPM</h3><div class="limit" id="currentRpmDisplay">0</div></div>
             <div><h3>Stream</h3><div class="limit" id="streamDisplay" style="color:#00ff88;">idle</div></div>
-            <div><h3>Circuit</h3><div class="limit" id="circuitDisplay" style="color:#00ff88;">CLOSED</div></div>
+            <div><h3>Cooldowns</h3><div class="limit" id="cooldownCountDisplay" style="color:#00ff88;">0</div></div>
         </div>
         <div class="stats-grid">
             <div class="stat-card"><h3>Total</h3><div class="value" id="totalRequests">0</div></div>
@@ -291,6 +354,7 @@ async def dashboard(request: Request):
             <div class="stat-card"><h3>Holdout OK</h3><div class="value" style="color:#00ff88;" id="holdoutOkCount">0</div></div>
             <div class="stat-card"><h3>Holdout FAIL</h3><div class="value" style="color:#ff4444;" id="holdoutFailCount">0</div></div>
         </div>
+        <div class="section"><h2>Model Cooldowns</h2><div id="cooldownContainer"><p style="color:#555;font-size:0.85rem;">None — all models available</p></div></div>
         <div class="section"><h2>Queue</h2><div id="queueContainer"><p style="color:#555;font-size:0.85rem;">Idle</p></div></div>
         <div class="section">
             <h2>Request Log</h2>
@@ -298,7 +362,7 @@ async def dashboard(request: Request):
                 <table>
                     <thead>
                         <tr>
-                            <th>ID</th><th>Status</th>
+                            <th>ID</th><th>Model</th><th>Status</th>
                             <th>Sent to NVIDIA</th><th>Completed</th><th>Duration</th>
                             <th>Holdout Waited</th><th>Gap Prev→Sent</th><th>Holdout OK</th>
                         </tr>
@@ -318,8 +382,9 @@ async def dashboard(request: Request):
                 document.getElementById('cooldownDisplay').textContent = d.cooldown_buffer + 's';
                 document.getElementById('concurrencyDisplay').textContent = d.current_inflight + ' / ' + d.max_concurrency;
                 document.getElementById('currentRpmDisplay').textContent = d.current_rpm;
-                document.getElementById('circuitDisplay').textContent = d.circuit_breaker_open ? 'OPEN' : 'CLOSED';
-                document.getElementById('circuitDisplay').style.color = d.circuit_breaker_open ? '#ff4444' : '#00ff88';
+                const cd = d.model_cooldowns || [];
+                document.getElementById('cooldownCountDisplay').textContent = cd.length;
+                document.getElementById('cooldownCountDisplay').style.color = cd.length > 0 ? '#ff8800' : '#00ff88';
                 document.getElementById('streamDisplay').textContent = d.stream_in_progress ? 'active' : 'idle';
                 document.getElementById('streamDisplay').style.color = d.stream_in_progress ? '#00aaff' : '#00ff88';
                 document.getElementById('totalRequests').textContent = d.stats.total_requests;
@@ -333,6 +398,11 @@ async def dashboard(request: Request):
                 document.getElementById('holdoutOkCount').textContent = holdoutOk;
                 document.getElementById('holdoutFailCount').textContent = holdoutFail;
 
+                const cc = document.getElementById('cooldownContainer');
+                cc.innerHTML = cd.length > 0
+                    ? cd.map(c => '<div style="padding:4px 0;font-size:0.85rem;"><span style="color:#ff8800;">' + c.model + '</span> <span class="mono">benched ' + c.remaining_seconds + 's (until ' + c.until + ')</span></div>').join('')
+                    : '<p style="color:#555;font-size:0.85rem;">None — all models available</p>';
+
                 const q = document.getElementById('queueContainer');
                 q.innerHTML = d.queue.length > 0
                     ? d.queue.map(i => '<div style="padding:4px 0;font-size:0.85rem;">' + i.method + ' ' + i.path + ' <span class="status-queued">Queued</span> <span class="mono">(' + i.wait_time + 's)</span></div>').join('')
@@ -345,11 +415,12 @@ async def dashboard(request: Request):
                     const dur = r.response_time ? r.response_time.toFixed(2) + 's' : '-';
                     const hw = (r.holdout_waited || 0).toFixed(2) + 's';
                     const gap = (r.gap_from_previous || 0).toFixed(2) + 's';
+                    const model = r.model ? r.model.split('/').pop() : '-';
                     let ok;
                     if (r.holdout_compliant === true) ok = '<span class="badge-ok">OK</span>';
                     else if (r.holdout_compliant === false) ok = '<span class="badge-fail">FAIL</span>';
                     else ok = '<span class="badge-na">N/A</span>';
-                    return '<tr><td class="mono">#' + r.id + '</td><td class="status-' + r.status.toLowerCase() + '">' + r.status + '</td><td class="mono">' + sent +
+                    return '<tr><td class="mono">#' + r.id + '</td><td class="mono">' + model + '</td><td class="status-' + r.status.toLowerCase() + '">' + r.status + '</td><td class="mono">' + sent +
                         '</td><td class="mono">' + comp + '</td><td class="mono">' + dur + '</td><td class="mono">' + hw +
                         '</td><td class="mono">' + gap + '</td><td>' + ok + '</td></tr>';
                 }).join('');
@@ -374,7 +445,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 "max_concurrency": MAX_CONCURRENT_REQUESTS, "current_inflight": INFLIGHT_REQUESTS,
                 "stats": stats, "queue": [r.to_dict() for r in queue],
                 "request_log": [r.to_dict() for r in request_log][-50:],
-                "circuit_breaker_open": CIRCUIT_BREAKER_OPEN,
+                "model_cooldowns": get_cooldowns_snapshot(),
                 "stream_in_progress": not stream_complete_event.is_set()
             }
             await websocket.send_json(data)
@@ -386,20 +457,50 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_handler(request: Request, path: str):
-    global last_completion_time, last_send_time, CIRCUIT_BREAKER_OPEN, INFLIGHT_REQUESTS
+    global last_completion_time, last_send_time, INFLIGHT_REQUESTS
     if request.method == "OPTIONS":
         return Response(status_code=204)
-
-    if CIRCUIT_BREAKER_OPEN:
-        log(f"REJECTED {request.method} /{path} — circuit breaker OPEN (proxy locked)", tag="circuit-breaker")
-        return Response(content='{"error":"Proxy locked — NVIDIA rate-limited previously. Restart proxy to retry."}', status_code=429, media_type="application/json")
 
     stats["total_requests"] += 1
     req_info = RequestInfo(request.method, f"/{path}")
 
+    # ---- read the body up front: needed both to detect the model (for the
+    #      per-model cooldown gate) and to prune oversized chat context ----
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        req_info.status = "Disconnected"
+        stats["failed_requests"] += 1
+        log("client disconnected before send — no NVIDIA call made", req_info, tag="disconnect")
+        return Response(status_code=244, content="Client disconnected from proxy channel early.")
+
+    model = extract_model(body)
+    req_info.model = model
+
+    # ---- PER-MODEL COOLDOWN GATE: a benched model is rejected instantly here,
+    #      with no queueing or pacing, while every other model passes through ----
+    cooldown_until = await get_model_cooldown(model)
+    if cooldown_until is not None:
+        remaining = max(0, int(round(cooldown_until - time.time())))
+        avail = datetime.fromtimestamp(cooldown_until).strftime("%H:%M:%S")
+        req_info.status = "cooldown"
+        req_info.request_complete_time = datetime.now().isoformat()
+        request_log.append(req_info)
+        log(f"REJECTED /{path} model={model} — benched {remaining}s more (until {avail}); other models OK",
+            req_info, tag="cooldown")
+        return Response(
+            content=json.dumps({"error": {
+                "message": (f"Model '{model}' is in local cooldown after an NVIDIA gateway 429 "
+                            f"(per-model quota). Retry after ~{remaining}s (around {avail}). "
+                            f"Other models are unaffected — no proxy restart needed."),
+                "type": "model_cooldown", "code": 429,
+                "model": model, "retry_after_seconds": remaining}}),
+            status_code=429, media_type="application/json",
+            headers={"Retry-After": str(remaining)})
+
     async with queue_lock:
         queue.append(req_info)
-    log(f"RECEIVED {request.method} /{path}  (queue depth: {len(queue)})", req_info)
+    log(f"RECEIVED {request.method} /{path}  model={model or '-'}  (queue depth: {len(queue)})", req_info)
 
     wait_start = time.time()
 
@@ -422,14 +523,7 @@ async def proxy_handler(request: Request, path: str):
         upstream = None
         handed_off_to_relay = False
         try:
-            try:
-                body = await request.body()
-                body = await maybe_prune_chat_context(body, f"/{path}")
-            except ClientDisconnect:
-                req_info.status = "Disconnected"
-                stats["failed_requests"] += 1
-                log("client disconnected before send — no NVIDIA call made", req_info, tag="disconnect")
-                return Response(status_code=244, content="Client disconnected from proxy channel early.")
+            body = await maybe_prune_chat_context(body, f"/{path}")
 
             fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in ("host",)}
             fwd_headers["host"] = "integrate.api.nvidia.com"
@@ -482,12 +576,19 @@ async def proxy_handler(request: Request, path: str):
             log(f"NVIDIA responded status={upstream.status_code}", req_info, tag="recv")
 
             if upstream.status_code == 429:
-                CIRCUIT_BREAKER_OPEN = True
+                expiry = await put_model_cooldown(model, MODEL_COOLDOWN_SECONDS)
                 req_info.status = "rate-limited"
                 stats["rate_limited_requests"] += 1
                 try: err_body = await upstream.aread()
                 except Exception: err_body = b""
-                log("NVIDIA returned 429 — locking proxy (circuit breaker) until restart", req_info, tag="circuit-breaker")
+                if expiry is not None:
+                    avail = datetime.fromtimestamp(expiry).strftime("%H:%M:%S")
+                    log(f"NVIDIA 429 for model={model} — benching it {MODEL_COOLDOWN_SECONDS}s "
+                        f"(until {avail}); other models keep working, no restart needed",
+                        req_info, tag="cooldown")
+                else:
+                    log("NVIDIA 429 but no model field in body — cannot bench a specific model; "
+                        "passing the 429 through unchanged", req_info, tag="cooldown")
                 return Response(content=err_body, status_code=429)
 
             if upstream.status_code >= 400:
@@ -565,6 +666,7 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--timeout", "-t", type=int, default=500)
     parser.add_argument("--cooldown", "-c", type=float, default=1.67, help="Post-completion holdout buffer in seconds")
+    parser.add_argument("--model-cooldown", type=int, default=7200, help="Seconds to bench a model after it returns a 429 (default 7200 = 2h)")
     parser.add_argument("--max-context-tokens", type=int, default=170000)
     parser.add_argument("--keep-last-messages", type=int, default=30)
     parser.add_argument("--no-context-pruning", dest="context_pruning", action="store_false")
@@ -573,11 +675,12 @@ def main():
     args = parser.parse_args()
 
     global RATE_LIMIT_REQUESTS, UPSTREAM_TIMEOUT_SECONDS, MAX_CONCURRENT_REQUESTS, ENABLE_CONTEXT_PRUNING
-    global MAX_CONTEXT_TOKENS, KEEP_LAST_MESSAGES, COOLDOWN_BUFFER
+    global MAX_CONTEXT_TOKENS, KEEP_LAST_MESSAGES, COOLDOWN_BUFFER, MODEL_COOLDOWN_SECONDS
 
     RATE_LIMIT_REQUESTS = args.rpm
     UPSTREAM_TIMEOUT_SECONDS = args.timeout
     COOLDOWN_BUFFER = args.cooldown
+    MODEL_COOLDOWN_SECONDS = args.model_cooldown
     MAX_CONCURRENT_REQUESTS = 1
     ENABLE_CONTEXT_PRUNING = args.context_pruning
     MAX_CONTEXT_TOKENS = args.max_context_tokens
@@ -593,7 +696,7 @@ def main():
     print(f"  Console Logging:    Per-request RECEIVED / SEND / RECV / COMPLETED with timestamps + real gaps")
     print(f"  Pruning Logic:      Enabled (Ceiling: {MAX_CONTEXT_TOKENS} tokens)")
     print(f"  Message Window:     Always preserve last {KEEP_LAST_MESSAGES} loops")
-    print(f"  429 Handling:       Hard circuit breaker — locks proxy on first 429")
+    print(f"  429 Handling:       Per-model cooldown — bench the offending model {MODEL_COOLDOWN_SECONDS}s ({MODEL_COOLDOWN_SECONDS/3600:.2g}h), other models keep flowing, no restart")
     print(f"{'='*60}\n")
 
     uvicorn.run(app, host=args.host, port=args.port)
